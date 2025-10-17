@@ -1,0 +1,611 @@
+﻿# F:\study_with_me\study_tracker.py
+import asyncio, time, re, sqlite3, os, sys, traceback, random, html
+from datetime import datetime, timedelta, timezone
+
+# ---- Timezone (Asia/Tashkent) with fallback ----
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo("Asia/Tashkent")
+except Exception:
+    TZ = timezone(timedelta(hours=5))  # UTC+5 fallback
+
+from telethon import TelegramClient, functions, types
+from telethon.utils import get_peer_id
+
+# --- single-instance guard (Windows, robust) ---
+import ctypes, ctypes.wintypes
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_CreateMutexW = _kernel32.CreateMutexW
+_GetLastError  = _kernel32.GetLastError
+_CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.wintypes.BOOL, ctypes.wintypes.LPCWSTR]
+_CreateMutexW.restype  = ctypes.wintypes.HANDLE
+try:
+    _ST_MUTEX = _CreateMutexW(None, False, r"Global\\StudyTrackerMutex")
+    # Do not exit on ERROR_ALREADY_EXISTS; the service wrapper already enforces single-instance.
+except Exception:
+    _ST_MUTEX = None# ---- logging (to tracker.log) ----
+import logging, logging.handlers, builtins
+logger = logging.getLogger("tracker")
+logger.setLevel(logging.INFO)
+fh = logging.handlers.RotatingFileHandler(
+    "tracker.log", maxBytes=2_000_000, backupCount=7, encoding="utf-8"
+)
+fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+logger.addHandler(fh)
+
+_builtin_print = builtins.print
+def print(*args, **kwargs):
+    s = " ".join(str(a) for a in args)
+    try: logger.info(s)
+    except Exception: pass
+    _builtin_print(*args, **kwargs)
+
+# ====== CONFIG ======
+API_ID   = 27333292
+API_HASH = "d8e1fbba6f100090d6876036ccb121df"
+SESSION  = "study_session"                    # keep a single session file
+GROUP    = "https://t.me/studywithferuzbek"   # your group invite
+
+POLL_EVERY  = 10
+POST_HOUR   = 22
+POST_MINUTE = 0
+DB_PATH     = "study.db"
+
+# ====== DISPLAY / COMPLIMENTS ======
+SHOW_MAX_PER_LIST = 10
+USE_COMPLIMENTS   = True
+
+# NEW: allow counting the tracker account itself while you test
+TRACK_SELF = True
+
+client = TelegramClient(SESSION, API_ID, API_HASH)
+MY_ID: int | None = None
+
+# ---------- Guard: avoid running two copies using session file ----------
+def assert_session_free():
+    sess_path = f"{SESSION}.session"
+    if not os.path.exists(sess_path):
+        return
+    try:
+        con = sqlite3.connect(sess_path, timeout=1)
+        con.execute("PRAGMA user_version")
+        con.close()
+    except sqlite3.OperationalError:
+        print("\n[ABORT] Another copy of study_tracker.py (or Task Scheduler) is already using"
+              f" '{sess_path}'. Close it first.\n")
+        sys.exit(1)
+
+# ---------- DB helpers ----------
+def _con():
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    try: con.execute("PRAGMA journal_mode=WAL")
+    except Exception: pass
+    return con
+
+def db_init():
+    con = _con(); cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS seconds_totals (
+        d TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        seconds INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (d, user_id)
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS user_cache (
+        user_id INTEGER PRIMARY KEY,
+        display_name TEXT,
+        username TEXT
+    )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS compliments_period (
+            period   TEXT NOT NULL,
+            user_id  INTEGER NOT NULL,
+            compliment TEXT NOT NULL,
+            PRIMARY KEY (period, user_id)
+        )
+    """)
+    con.commit(); con.close()
+
+def _add_seconds_for_date(date_str: str, user_id: int, delta: int):
+    if delta <= 0: return
+    con = _con(); cur = con.cursor()
+    cur.execute("INSERT OR IGNORE INTO seconds_totals(d,user_id,seconds) VALUES(?,?,0)", (date_str, user_id))
+    cur.execute("UPDATE seconds_totals SET seconds = seconds + ? WHERE d = ? AND user_id = ?",
+                (int(delta), date_str, user_id))
+    con.commit(); con.close()
+
+def db_add_span(user_id: int, start_ts: float, end_ts: float):
+    if user_id is None or end_ts <= start_ts: return
+    cur_ts = start_ts
+    while cur_ts < end_ts:
+        dt = datetime.fromtimestamp(cur_ts, TZ)
+        next_day_ts = (datetime(dt.year, dt.month, dt.day, tzinfo=TZ) + timedelta(days=1)).timestamp()
+        chunk_end = min(end_ts, next_day_ts)
+        _add_seconds_for_date(dt.date().isoformat(), user_id, int(chunk_end - cur_ts))
+        cur_ts = chunk_end
+
+def db_set_meta(k: str, v: str):
+    con = _con(); cur = con.cursor()
+    cur.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (k, v))
+    con.commit(); con.close()
+
+def db_get_meta(k: str) -> str | None:
+    con = _con(); cur = con.cursor()
+    cur.execute("SELECT v FROM meta WHERE k = ?", (k,))
+    row = cur.fetchone(); con.close()
+    return row[0] if row else None
+
+def db_cache_user(user_id: int, display_name: str, username: str | None):
+    con = _con(); cur = con.cursor()
+    cur.execute("INSERT OR REPLACE INTO user_cache(user_id, display_name, username) VALUES(?,?,?)",
+                (user_id, display_name, username or None))
+    con.commit(); con.close()
+
+def db_fetch_period_seconds(start_date: datetime, end_date: datetime):
+    sd = start_date.date().isoformat(); ed = end_date.date().isoformat()
+    con = _con(); cur = con.cursor()
+    cur.execute("""
+        SELECT user_id, SUM(seconds)
+        FROM seconds_totals
+        WHERE d BETWEEN ? AND ?
+        GROUP BY user_id
+        ORDER BY SUM(seconds) DESC
+    """, (sd, ed))
+    rows = cur.fetchall(); con.close()
+    return [(int(uid), int(sec)) for (uid, sec) in rows]
+
+# ---------- Persistent anchor (for DAY/WEEK/MONTH numbers) ----------
+def _ensure_anchor() -> datetime:
+    v = db_get_meta("anchor_date")
+    if v:
+        try: return datetime.fromisoformat(v).replace(tzinfo=TZ)
+        except Exception: pass
+    today = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    db_set_meta("anchor_date", today.date().isoformat())
+    return today
+
+def _format_d(d: datetime) -> str: return d.strftime("%d.%m.%y")
+def _dow(d: datetime) -> str:      return d.strftime("%A").upper()
+def _day_index(anchor: datetime, today: datetime) -> int:
+    return (today.date() - anchor.date()).days + 1
+
+def _week_block(anchor: datetime, today: datetime):
+    days = (today.date() - anchor.date()).days
+    idx = (days // 7) + 1
+    start = anchor + timedelta(days=(idx-1)*7)
+    end   = start + timedelta(days=6)
+    return idx, start, end
+
+def _month30_block(anchor: datetime, today: datetime):
+    days = (today.date() - anchor.date()).days
+    idx = (days // 30) + 1
+    start = anchor + timedelta(days=(idx-1)*30)
+    end   = start + timedelta(days=29)
+    return idx, start, end
+
+# ---------- Telegram helpers ----------
+async def ensure_connected():
+    if client.is_connected(): return
+    try:
+        await client.connect()
+    except Exception as e:
+        print(f"Reconnect failed: {e!r}")
+
+async def resolve_group(target: str):
+    await ensure_connected()
+    m = re.search(r'(?:t\.me\/\+|t\.me\/joinchat\/|\+|joinchat\/)([A-Za-z0-9_-]+)', target)
+    if m:
+        inv_hash = m.group(1)
+        try:
+            info = await client(functions.messages.CheckChatInviteRequest(inv_hash))
+            if isinstance(info, types.ChatInviteAlready):
+                ent = await client.get_entity(info.chat.id)
+                print("Resolved via invite (already joined):", getattr(ent, 'title', getattr(ent, 'username', ''))); return ent
+            joined = await client(functions.messages.ImportChatInviteRequest(inv_hash))
+            chat = joined.chats[0]
+            ent = await client.get_entity(chat.id)
+            print("Joined via invite:", getattr(ent, 'title', getattr(ent, 'username', ''))); return ent
+        except Exception as e:
+            print("Invite resolve/join failed:", e)
+    ent = await client.get_entity(target)
+    print("Resolved via username/ID:", getattr(ent, 'title', getattr(ent, 'username', ''))); return ent
+
+async def get_current_group_call(ent):
+    await ensure_connected()
+    try:
+        full = (await client(functions.channels.GetFullChannelRequest(ent))
+                if isinstance(ent, types.Channel)
+                else await client(functions.messages.GetFullChatRequest(ent.id)))
+    except Exception as e:
+        print("GetFull* error:", e); return None
+    fc = getattr(full, "full_chat", None)
+    call = getattr(fc, "call", None)
+    if not call: return None
+    return types.InputGroupCall(id=call.id, access_hash=call.access_hash)
+
+async def fetch_participants(input_call):
+    await ensure_connected()
+    gp = await client(functions.phone.GetGroupParticipantsRequest(
+        call=input_call, ids=[], sources=[], offset="", limit=200
+    ))
+    users_map = {u.id: u for u in gp.users}
+    out = []
+    for p in gp.participants:
+        peer = getattr(p, "peer", None)
+        if isinstance(peer, types.PeerChannel):
+            continue
+        try: uid = get_peer_id(peer)
+        except Exception: uid = getattr(p, "user_id", None)
+        if not uid: continue
+        u = users_map.get(uid)
+        if not u:
+            try: u = await client.get_entity(uid)
+            except Exception: u = None
+        if u:
+            name = (u.first_name or "") + (" " + u.last_name if getattr(u, "last_name", None) else "")
+            handle = getattr(u, "username", None)
+        else:
+            name, handle = str(uid), None
+        try: db_cache_user(uid, name.strip(), handle)
+        except Exception: pass
+        out.append((uid, name.strip(), handle))
+    return out
+
+# ---------- Compliments / formatting ----------
+def _load_compliments_file(path="compliments.txt"):
+    pool = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("["): continue
+                pool.append(s)
+    except FileNotFoundError:
+        pass
+    return pool
+
+_COMPL_EXTRAS = [
+    "Iron Discipline 🦾","Early Bird Energy 🌞","Distraction Slayer 🛡️","Deep Work Dynamo ⚡",
+    "Laser Precision 🛰️","Leveling Up 📈","Night Owl Power 🌙","Flow Controller 🎛️",
+    "Habit Climber 🧗","Full Throttle 🏎️","King of Study 👑","Lord of Focus 🗡️",
+    "Alpha Concentration 🦁","Craftsman of Consistency 🛠️","Power Grinder 🔧",
+    "Queen of Study 👑","Angel of Focus 🪽","Graceful Grinder 🌸","Rhythm of Discipline 💃",
+    "Weaver of Consistency 🧵","Moonlight Scholar 🌙","Study Engine 📚","Target Locked 🎯",
+    "Focus Machine 🧠","Productivity Ninja 🥷","Finish Line Closer 🏁","Streak Keeper 📆",
+    "Premium Grinder 💎","Consistency Beast 💪","King of Focus 👑","Study Titan 🗿",
+    "Mind Sprint 🏃‍♂️","Momentum Master 🧲","Calm Laser 🎯","Unbreakable Chain ⛓️",
+    "No-Excuse Executor ✅","Deadline Tamer ⏳","Clarity Crafter ✨","Courage of Action 🦅",
+    "Relentless Rhythm 🥁","Shadow of Distraction ☄️","Focus Lighthouse 🗼",
+    "Steady Flame 🔥","Bold Consistency 🧱","Quiet Thunder ⚡","Grit Architect 🧱",
+    "Habit Sculptor 🪚","Minute Millionaire 🕰️","Study Momentum 🚀","Page Turner 📖",
+    "First In, Last Out 🚪","Mind Gardener 🌿","Storm-Proof Focus ⛈️","Zen Executioner 🧘",
+    "Precision Pilot 🧭","Depth Diver 🐬","Quiet Conqueror 🤫","Willpower Weaver 🪡",
+    "Discipline Dancer 🎼","Task Wrangler 🤠","Flow Surfer 🏄","Stamina Engine ⚙️",
+    "Craft of Patience 🪵","Focus Alchemist ⚗️","Study Sentinel 🛡️","Hustle Maestro 🎼",
+    "Crown of Calm 👑","Laser Archer 🏹","Morning Star ⭐","Evening Torch 🔥",
+    "Habit Ranger 🧭","Focus Smith 🔨","Boundless Breath 🌬️","Time Whisperer 🕊️",
+    "Pathfinder of Progress 🧭","Pulse of Persistence 💓","Mind Fortress 🏰",
+    "Climb of Mastery 🏔️","Grace Under Fire 🔥","Diamond Focus 💎","Echo of Effort 📢",
+    "Atlas of Tasks 🗺️","Evergreen Habits 🌲","Sailor of Flow ⛵","Study Sculptor 🗿",
+    "Momentum Rider 🐎","Beacon of Routine 🗼","Quiet Blaze 🔥","Peak Consistency 🏔️",
+    "Sentry of Focus 🚧","Anchor of Habit ⚓","Praxis Champion 🏆","Tempo Tactician 🥁",
+    "Stillness Power 🌊","Minute Samurai 🗡️","Craft of Depth 🪚","Effort Composer 🎻",
+    "Order Oracle 🧿","Time Artisan 🎨","Ritual Runner 🏃","Focus Navigator 🧭",
+    "Study Voyager 🚀","Calm Commander 🫡","Precision Crafter 🪛","Discipline Smith 🔨",
+    "Courageous Focus 🛡️","Patience Pilot ✈️","Focus Monk 🛕","Study Bard 🎶",
+    "Resolute Rhythm 🥁","Will of Granite 🪨","Horizon Hunter 🌅","Craft of Momentum 🧰",
+    "Serene Storm ⛈️","Task Sculptor 🧱","Endurance Engine 🔩","Mind Cartographer 🗺️",
+]
+
+def _load_compliments():
+    seen = set(); merged = []
+    for s in _load_compliments_file() + _COMPL_EXTRAS:
+        s = s.strip()
+        if not s or s in seen: continue
+        merged.append(s); seen.add(s)
+    if not merged:
+        merged = ["Consistency Beast 💪", "Focus Machine 🧠", "Iron Discipline 🦾"]
+    return merged
+
+_COMPL_POOL = _load_compliments()
+
+def fmt_name(uid: int) -> str:
+    """Return 'Display Name (@username)' if username exists, else 'Display Name'."""
+    con = _con(); cur = con.cursor()
+    cur.execute("SELECT display_name, username FROM user_cache WHERE user_id = ?", (uid,))
+    row = cur.fetchone(); con.close()
+    if not row: return str(uid)
+    display_name, username = row
+    display_name = display_name or str(uid)
+    return f"{display_name} (@{username})" if username else display_name
+
+# ---------- Compliment persistence ----------
+def _period_key_day(d: datetime)   -> str: return f"day:{d.date().isoformat()}"
+def _period_key_week(start: datetime)-> str: return f"week:{start.date().isoformat()}"
+def _period_key_month(start: datetime)-> str: return f"month:{start.date().isoformat()}"
+
+def _get_saved_compliment(pk: str, user_id: int) -> str | None:
+    con = _con(); cur = con.cursor()
+    cur.execute("SELECT compliment FROM compliments_period WHERE period = ? AND user_id = ?", (pk, user_id))
+    row = cur.fetchone(); con.close()
+    return row[0] if row else None
+
+def _save_compliment(pk: str, user_id: int, txt: str):
+    con = _con(); cur = con.cursor()
+    cur.execute("INSERT OR REPLACE INTO compliments_period(period, user_id, compliment) VALUES(?,?,?)",
+                (pk, user_id, txt))
+    con.commit(); con.close()
+
+def _all_used_for_scope(prefix: str, user_id: int) -> set[str]:
+    con = _con(); cur = con.cursor()
+    cur.execute("SELECT compliment FROM compliments_period WHERE period LIKE ? AND user_id = ?",
+                (f"{prefix}%", user_id))
+    rows = [r[0] for r in cur.fetchall()]
+    con.close()
+    return set(rows)
+
+def _choose_from_pool(exclude: set[str]) -> str:
+    pool = [c for c in _COMPL_POOL if c not in exclude]
+    if not pool: pool = list(_COMPL_POOL)
+    random.shuffle(pool)
+    return pool[0]
+
+def choose_weekly(user_id: int, week_start: datetime) -> str:
+    pk = _period_key_week(week_start)
+    prev = _get_saved_compliment(pk, user_id)
+    if prev: return prev
+    used_before = _all_used_for_scope("week:", user_id)
+    c = _choose_from_pool(used_before); _save_compliment(pk, user_id, c); return c
+
+def choose_monthly(user_id: int, month_start: datetime) -> str:
+    pk = _period_key_month(month_start)
+    prev = _get_saved_compliment(pk, user_id)
+    if prev: return prev
+    used_before = _all_used_for_scope("month:", user_id)
+    c = _choose_from_pool(used_before); _save_compliment(pk, user_id, c); return c
+
+def choose_daily(user_id: int, day_dt: datetime, avoid: set[str]) -> str:
+    pk = _period_key_day(day_dt)
+    prev = _get_saved_compliment(pk, user_id)
+    if prev: return prev
+    c = _choose_from_pool(avoid); _save_compliment(pk, user_id, c); return c
+
+# ---------- Ranking/formatting ----------
+def _rank_medal(i: int) -> str:
+    return "🥇" if i == 1 else ("🥈" if i == 2 else ("🥉" if i == 3 else ""))
+
+_KEYCAPS = {"1":"1️⃣","2":"2️⃣","3":"3️⃣","4":"4️⃣","5":"5️⃣","6":"6️⃣","7":"7️⃣","8":"8️⃣","9":"9️⃣","10":"🔟"}
+def _rank_keycap(n: int) -> str: return _KEYCAPS.get(str(n), str(n)) if 1 <= n <= 10 else str(n)
+
+def _badge_for_minutes(mins: int) -> str:
+    if mins >= 180: return "🚀"
+    if mins >= 120: return "🔥"
+    if mins >=  60: return "💪"
+    if mins >=   1: return "✅"
+    return "😴"
+
+def _mins(secs: int) -> int: return max(0, secs // 60)
+
+def _unique_sorted(rows):
+    best = {}
+    for uid, secs in rows: best[uid] = max(secs, best.get(uid, 0))
+    return sorted(best.items(), key=lambda x: x[1], reverse=True)
+
+def _b(s: str) -> str: return f"<b>{html.escape(s)}</b>"
+
+_DAY_FLARES = ["💥","❤️‍🔥","👑","🔥","⚡","🌟","🏁","🎯","💫","🧠","🦁","🪽","🧵","🛡️","🌙","🚀","✨","💎"]
+def _title_with_day(anchor: datetime, today: datetime) -> str:
+    day_idx = _day_index(anchor, today)
+    flare = _DAY_FLARES[(day_idx-1) % len(_DAY_FLARES)]
+    return f"📊 {_b('LEADERBOARD')} — DAY {day_idx} {flare}"
+
+def _format_section(label: str, header_right: str, rows, compliments_by_user):
+    if not rows: return f"{_b(label)} — nobody did lessons 😴"
+    lines = [f"{_b(label)} — {header_right}"]
+    for idx, (uid, secs) in enumerate(rows[:SHOW_MAX_PER_LIST], 1):
+        mins = _mins(secs)
+        name = html.escape(fmt_name(uid))
+        rank = _rank_medal(idx) or _rank_keycap(idx)
+        badge = _badge_for_minutes(mins)
+        tail = ""
+        if USE_COMPLIMENTS:
+            comp = compliments_by_user.get(uid)
+            if comp: tail = f" − {html.escape(comp)}"
+        lines.append(f"{rank} {name} — {mins}m {badge}{tail}")
+    return "\n".join(lines)
+
+# ---------- GROUP CHANGE AUTO-RESET ----------
+def _reset_all_state_for_new_group(new_group_key: str):
+    today = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    con = _con(); cur = con.cursor()
+    cur.execute("DELETE FROM seconds_totals")
+    cur.execute("DELETE FROM compliments_period")
+    cur.execute("DELETE FROM meta WHERE k IN ('last_post_date','anchor_date','quote_index','quote_seed','group_key','group_since')")
+    con.commit(); con.close()
+    db_set_meta("anchor_date", today.date().isoformat())
+    db_set_meta("group_key", new_group_key)
+    db_set_meta("group_since", today.date().isoformat())
+    db_set_meta("quote_index", "0")
+    print(f"[reset] Detected new group. Counters & indices reset. Anchor set to {today.date().isoformat()}.")
+
+def _maybe_reset_on_group_change(ent):
+    try: new_key = str(get_peer_id(ent))
+    except Exception:
+        new_key = f"{getattr(ent,'id',None)}:{getattr(ent,'username',None)}:{getattr(ent,'title',None)}"
+    old_key = db_get_meta("group_key")
+    if old_key != new_key:
+        _reset_all_state_for_new_group(new_key)
+
+# ---------- Main post ----------
+async def post_leaderboard(ent, live_seen_snapshot: dict[int, float] | None = None):
+    await ensure_connected()
+    now = datetime.now(TZ)
+    anchor = _ensure_anchor()
+
+    week_idx, w_start, w_end = _week_block(anchor, now)
+    month_idx, m_start, m_end = _month30_block(anchor, now)
+
+    t_start = datetime(now.year, now.month, now.day, 0, 0, tzinfo=TZ)
+    t_end   = datetime(now.year, now.month, now.day, 23, 59, 59, tzinfo=TZ)
+
+    day_rows   = _unique_sorted(db_fetch_period_seconds(t_start, t_end))
+    week_rows  = _unique_sorted(db_fetch_period_seconds(w_start,  w_end))
+    month_rows = _unique_sorted(db_fetch_period_seconds(m_start, m_end))
+
+    if live_seen_snapshot:
+        now_ts = time.time()
+        def add_extra(rows):
+            best = dict(rows)
+            for uid, join_ts in live_seen_snapshot.items():
+                extra = int(now_ts - join_ts)
+                if extra > 0:
+                    best[uid] = best.get(uid, 0) + extra
+            return _unique_sorted(best.items())
+        day_rows   = add_extra(day_rows)
+        week_rows  = add_extra(week_rows)
+        month_rows = add_extra(month_rows)
+
+    week_comps, month_comps, day_comps = {}, {}, {}
+    if USE_COMPLIMENTS:
+        for uid, _ in week_rows[:SHOW_MAX_PER_LIST]:
+            week_comps[uid] = choose_weekly(uid, w_start)
+        for uid, _ in month_rows[:SHOW_MAX_PER_LIST]:
+            month_comps[uid] = choose_monthly(uid, m_start)
+        for uid, _ in day_rows[:SHOW_MAX_PER_LIST]:
+            avoid = {week_comps.get(uid, ""), month_comps.get(uid, "")}
+            avoid.discard("")
+            day_comps[uid] = choose_daily(uid, now, avoid)
+
+    title = _title_with_day(anchor, now)
+    today_hdr = f"{_format_d(now)} ({_dow(now)})"
+    week_hdr  = f"{_format_d(w_start)} - {_format_d(w_end)} (WEEK {week_idx})"
+    month_hdr = f"{_format_d(m_start)} - {_format_d(m_end)} (MONTH {month_idx})"
+
+    today_txt = _format_section("📅 Today",      today_hdr, day_rows,  day_comps)
+    week_txt  = _format_section("📆 This Week",  week_hdr,  week_rows, week_comps)
+    month_txt = _format_section("🗓️ This Month", month_hdr, month_rows, month_comps)
+
+    msg = f"{title}\n\n{today_txt}\n\n{week_txt}\n\n{month_txt}"
+    await client.send_message(ent, msg, parse_mode="html")
+    db_set_meta("last_post_date", now.date().isoformat())
+    print(f"Posted leaderboard for {now.date().isoformat()}.")
+
+# ---------- Main loop ----------
+async def main():
+    global MY_ID
+    assert_session_free()
+    db_init()
+
+    # Robust initial connect: do not exit hard if first attempt fails
+    try:
+        await client.connect()
+    except Exception as e:
+        print(f"Initial connect failed: {e!r} — will retry in loop.")
+
+    is_auth = False
+    try:
+        is_auth = await client.is_user_authorized()
+    except Exception:
+        pass
+    if not is_auth:
+    print("Not logged in. Waiting for session; will retry every 60s.")
+    while True:
+        try:
+            await client.connect()
+            try:
+                if await client.is_user_authorized():
+                    print("Auth became available; continuing.")
+                    break
+            except Exception:
+                pass
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+    ent = await resolve_group(GROUP)
+    _maybe_reset_on_group_change(ent)
+
+    print("Tracker running. Will post automatically at 22:00 Asia/Tashkent.")
+    me = await client.get_me()
+    MY_ID = me.id
+    print("Running as user id:", MY_ID)
+
+    if "--post-now" in sys.argv:
+        try: await post_leaderboard(ent, live_seen_snapshot=None)
+        finally: return
+
+    # Catch-up on startup if we missed today's post already
+    now = datetime.now(TZ)
+    today_str = now.date().isoformat()
+    last_posted = db_get_meta("last_post_date")
+    if (now.hour, now.minute) >= (POST_HOUR, POST_MINUTE) and last_posted != today_str:
+        try:
+            await post_leaderboard(ent, live_seen_snapshot=None)
+            print("[catch-up] Posted today’s leaderboard on startup.")
+        except Exception as e:
+            print("Catch-up post error:", e)
+
+    seen: dict[int, float] = {}
+    idle_ping = 0.0
+    while True:
+        await ensure_connected()
+        now = datetime.now(TZ)
+        today_str = now.date().isoformat()
+
+        # Re-read DB each tick so meta_tool edits (resets) apply immediately
+        last_posted = db_get_meta("last_post_date")
+
+        if (now.hour, now.minute) >= (POST_HOUR, POST_MINUTE) and last_posted != today_str:
+            try:
+                await post_leaderboard(ent, live_seen_snapshot=seen.copy())
+            except Exception:
+                print("Post error:"); traceback.print_exc()
+
+        try:
+            call = await get_current_group_call(ent)
+            if not call:
+                if time.time() - idle_ping > 300:
+                    print(f"[{datetime.now(TZ).strftime('%H:%M')}] idle; waiting for live…")
+                    idle_ping = time.time()
+                if seen:
+                    now_ts = time.time()
+                    for uid, start_ts in list(seen.items()):
+                        db_add_span(uid, start_ts, now_ts)
+                        seen.pop(uid, None)
+                await asyncio.sleep(12)
+                continue
+
+            participants = await fetch_participants(call)
+
+            # Include or skip self based on TRACK_SELF
+            def _include(uid: int | None) -> bool:
+                return uid and (TRACK_SELF or uid != MY_ID)
+
+            current = {uid for uid, _, _ in participants if _include(uid)}
+            now_ts = time.time()
+
+            for uid in current:
+                if uid not in seen: seen[uid] = now_ts
+
+            for uid in list(seen.keys()):
+                if uid not in current:
+                    start_ts = seen.pop(uid)
+                    db_add_span(uid, start_ts, now_ts)
+
+            names_now = [n for uid, n, _ in participants if n and _include(uid)]
+            print(f"[{datetime.now(TZ).strftime('%H:%M:%S')}] In call ({len(current)}): "
+                  f"{', '.join(names_now) if names_now else '—'}")
+            await asyncio.sleep(POLL_EVERY)
+
+        except Exception:
+            print("Loop error:"); traceback.print_exc()
+            await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    try: asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nExiting cleanly. Bye")
+
+
+
