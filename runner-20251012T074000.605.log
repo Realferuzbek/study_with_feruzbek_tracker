@@ -1,0 +1,5 @@
+2025-10-12 12:40:00 wrapper start as NT AUTHORITY\SYSTEM
+2025-10-12 12:40:00 launching: F:\study_with_me\.venv\Scripts\python.exe -u F:\study_with_me\study_tracker.py
+2025-10-12 12:40:00 started pid 6452
+2025-10-12 12:40:00 python exited code 1
+2025-10-12 12:40:00 wrapper end
