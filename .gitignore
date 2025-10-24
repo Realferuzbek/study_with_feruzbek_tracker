@@ -1,0 +1,14 @@
+# Node / Next.js
+node_modules/
+.next/
+out/
+dist/
+.vercel/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# dotenv (keep secrets out of Git)
+.env
+.env.*
+!.env.example

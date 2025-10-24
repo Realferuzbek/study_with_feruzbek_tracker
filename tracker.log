@@ -4932,3 +4932,29 @@ Exiting cleanly. Bye
 2025-10-24 00:09:06,889 Running as user id: 8344971256
 2025-10-24 00:09:07,304 [00:09:07] In call (0): —
 2025-10-24 00:19:12,459 [00:19:12] In call (0): —
+2025-10-24 17:28:02,357 Initial connect failed (will retry): ConnectionError: Connection to Telegram failed 5 time(s)
+2025-10-24 17:28:02,366 Traceback (most recent call last):
+2025-10-24 17:28:02,366   File "F:\study_with_me\study_tracker.py", line 1037, in main
+2025-10-24 17:28:02,367     await client.connect()
+2025-10-24 17:28:02,367   File "F:\study_with_me\.venv\Lib\site-packages\telethon\client\telegrambaseclient.py", line 552, in connect
+2025-10-24 17:28:02,367     if not await self._sender.connect(self._connection(
+2025-10-24 17:28:02,368            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2025-10-24 17:28:02,368     ...<6 lines>...
+2025-10-24 17:28:02,368     )):
+2025-10-24 17:28:02,368     ^^
+2025-10-24 17:28:02,368   File "F:\study_with_me\.venv\Lib\site-packages\telethon\network\mtprotosender.py", line 134, in connect
+2025-10-24 17:28:02,369     await self._connect()
+2025-10-24 17:28:02,369   File "F:\study_with_me\.venv\Lib\site-packages\telethon\network\mtprotosender.py", line 260, in _connect
+2025-10-24 17:28:02,369     raise ConnectionError('Connection to Telegram failed {} time(s)'.format(self._retries))
+2025-10-24 17:28:02,369 ConnectionError: Connection to Telegram failed 5 time(s)
+2025-10-24 17:28:02,370 Not logged in. Waiting for session; will retry every 60s.
+2025-10-24 17:29:04,808 Resolved via username/ID: Study With Me
+2025-10-24 17:29:04,815 Tracker running. Will post automatically at 22:00 Asia/Tashkent.
+2025-10-24 17:29:05,768 Running as user id: 8344971256
+2025-10-24 17:29:06,972 [17:29:06] In call (0): —
+2025-10-24 17:39:18,823 [17:39:18] In call (0): —
+2025-10-24 17:53:31,923 [17:53:31] In call (0): —
+2025-10-24 18:03:15,480 [connect] offline: Connection to Telegram failed 5 time(s)
+2025-10-24 18:03:15,481 [18:03:15] offline; waiting for Telegram/network…
+2025-10-24 18:03:26,534 [connect] offline: Connection to Telegram failed 5 time(s)
+2025-10-24 18:03:39,912 [18:03:39] In call (0): —
