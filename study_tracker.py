@@ -8,8 +8,8 @@
 # - Daily auto post at 22:00 Asia/Tashkent
 # - Manual "post now" without breaking daily schedule (post_now.flag)
 
-import asyncio, time, re, sqlite3, os, sys, traceback, random, html
-from datetime import datetime, timedelta, timezone
+import asyncio, time, re, sqlite3, os, sys, traceback, random, html, json
+from datetime import datetime, timedelta, timezone, date
 
 # ---- Timezone (Asia/Tashkent) with fallback ----
 try:
@@ -99,11 +99,50 @@ MIN_DAILY_SECONDS = 0
 # ---- Alias groups (merge these usernames as one person, shown as the canonical) ----
 # canonical_username: [canonical_username, alias1, alias2, ...]
 ALIAS_GROUPS_USERNAMES = {
-    "realferuzbek": ["realferuzbek", "study_tracker_bot_1", "studywithferuzbek"]
+    "realferuzbek": ["realferuzbek", "contact_admin_me", "studywithferuzbek"]
 }
+
+# Quiet roster logging unless call is active/changed
+ROSTER_LOG_EVERY = 300  # seconds; only print roster at most every 5 minutes
+
+# ---- Watchdog / alerts ----
+WATCHDOG_NOTIFY_TO = "realferuzbek"      # DM target (your main account)
+HEARTBEAT_THRESHOLDS = [300, 600, 900]   # alert at 5, 10, 15 minutes since last OK
 
 client = TelegramClient(SESSION, API_ID, API_HASH)
 MY_ID: int | None = None
+
+# ---------- NEW: Heartbeat / state (1/6) ----------
+HEARTBEAT_IDLE_EVERY = int(os.getenv("HEARTBEAT_IDLE_EVERY", "600"))   # 10 min when no livestream
+HEARTBEAT_OFFLINE_EVERY = int(os.getenv("HEARTBEAT_OFFLINE_EVERY", "60"))  # 1 min while offline
+STATE_FILE = "tracker_state.json"
+
+_last_idle_beat = 0.0
+_last_offline_beat = 0.0
+
+def _now_ts():
+    return time.time()
+
+def _log_beat(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    try:
+        logger.info("[%s] %s", ts, msg)
+    except Exception:
+        print(f"[{ts}] {msg}")
+
+def _load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_state(d):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except Exception:
+        pass
 
 # ---------- Guard: session file free ----------
 def assert_session_free():
@@ -246,31 +285,40 @@ def _quote_for_today(now: datetime):
     idx = ((now.date() - anchor.date()).days) % len(quotes)
     return quotes[idx]
 
-# ---------- Telegram request with backoff ----------
-async def _tg(req, retries=BACKOFF_RETRIES, base=BACKOFF_BASE):
-    """Run a Telethon request with exponential backoff."""
-    for attempt in range(1, retries + 1):
+# ---------- NEW: Safe Telegram wrapper (2/6 + 3/6) ----------
+class NetworkDown(Exception):
+    pass
+
+async def ensure_connected() -> bool:
+    """
+    Returns True if connected (and authorized), False if offline.
+    Never raises; callers can keep looping calmly.
+    """
+    try:
+        if not client.is_connected():
+            await client.connect()
         try:
-            return await client(req)
-        except Exception as e:
-            if attempt == retries:
-                raise
-            delay = base * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
-            print(f"[backoff] {req.__class__.__name__} failed (attempt {attempt}/{retries}): {e!r}; sleeping {delay:.1f}s")
-            await asyncio.sleep(delay)
+            ok = await client.is_user_authorized()
+            if not ok:
+                await client.start()
+        except Exception:
+            pass
+        return client.is_connected()
+    except Exception as e:
+        logger.warning("[connect] offline: %s", e)
+        return False
+
+async def _tg(req):
+    """Call Telegram safely. Raises NetworkDown if we are offline or transport fails."""
+    if not await ensure_connected():
+        raise NetworkDown("offline")
+    try:
+        return await client(req)
+    except Exception as e:
+        logger.debug("[tg] transient error: %r", e)
+        raise NetworkDown(str(e))
 
 # ---------- Telegram helpers ----------
-async def ensure_connected():
-    try:
-        if client.is_connected():
-            return
-    except Exception:
-        pass
-    try:
-        await client.connect()
-    except Exception as e:
-        _log_exc("[connect] failed", e)
-
 async def resolve_group(target: str):
     await ensure_connected()
 
@@ -296,26 +344,54 @@ async def resolve_group(target: str):
     ent = await client.get_entity(uname)
     print("Resolved via username/ID:", getattr(ent, 'title', getattr(ent, 'username', ''))); return ent
 
+# ---- NEW: Current group call (4/6) ----
 async def get_current_group_call(ent):
-    await ensure_connected()
+    """
+    Returns an InputGroupCall or None. Never explodes on disconnect.
+    """
+    # If we're offline, just say "no call" quietly
+    if not await ensure_connected():
+        return None
     try:
-        if isinstance(ent, types.Channel):
-            input_ch = types.InputChannel(channel_id=ent.id, access_hash=ent.access_hash)
-            full = await _tg(functions.channels.GetFullChannelRequest(channel=input_ch))
-        elif isinstance(ent, types.Chat):
-            full = await _tg(functions.messages.GetFullChatRequest(chat_id=ent.id))
-        else:
-            e = await client.get_entity(ent)
-            return await get_current_group_call(e)
-    except Exception as e:
-        _log_exc("GetFull* error", e)
-        return None
+        input_entity = await client.get_input_entity(ent)
 
-    fc = getattr(full, "full_chat", None)
-    call = getattr(fc, "call", None)
-    if not call:
+        if isinstance(ent, types.Channel) or isinstance(input_entity, types.InputChannel):
+            try:
+                full = await _tg(functions.channels.GetFullChannelRequest(channel=input_entity))
+            except NetworkDown:
+                return None
+            except Exception as e:
+                _log_exc("GetFullChannel primary failed", e)
+                try:
+                    fresh = await client.get_input_entity(getattr(ent, "username", ent))
+                    full = await _tg(functions.channels.GetFullChannelRequest(channel=fresh))
+                except Exception as e2:
+                    _log_exc("GetFullChannel retry failed", e2)
+                    return None
+
+        elif isinstance(ent, types.Chat) or isinstance(input_entity, types.InputPeerChat):
+            try:
+                full = await _tg(functions.messages.GetFullChatRequest(chat_id=ent.id if isinstance(ent, types.Chat) else input_entity.chat_id))
+            except NetworkDown:
+                return None
+            except Exception as e:
+                _log_exc("GetFullChat failed", e)
+                return None
+        else:
+            e2 = await client.get_entity(ent)
+            return await get_current_group_call(e2)
+
+        fc = getattr(full, "full_chat", None)
+        call = getattr(fc, "call", None)
+        if not call:
+            return None
+        return types.InputGroupCall(id=call.id, access_hash=call.access_hash)
+
+    except NetworkDown:
         return None
-    return types.InputGroupCall(id=call.id, access_hash=call.access_hash)
+    except Exception as e:
+        _log_exc("GetFull* error (outer)", e)
+        return None
 
 # ---------- PAGINATED participants ----------
 async def fetch_participants(input_call):
@@ -611,10 +687,11 @@ async def post_leaderboard(
     live_seen_snapshot: dict[int, float] | None = None,
     session_accum_secs: dict[int, int] | None = None,
     session_qualified: dict[int, bool] | None = None,
-    mark_daily: bool = True,   # <— NEW: only auto/catch-up should mark the day
+    mark_daily: bool = True,             # only auto/backfill should mark the day
+    override_now: datetime | None = None # ← NEW: post for a specific calendar day
 ):
     await ensure_connected()
-    now = datetime.now(TZ)
+    now = override_now or datetime.now(TZ)
     now_ts = time.time()
     anchor = _ensure_anchor()
 
@@ -638,24 +715,21 @@ async def post_leaderboard(
     week_rows  = _fold_alias_rows(week_rows, alias_to_canon)
     month_rows = _fold_alias_rows(month_rows, alias_to_canon)
 
-    # Adjust with live extras — only if current session meets 5m threshold
-    if live_seen_snapshot:
+    # Adjust with live extras — only if current session meets 5m threshold (only for "now")
+    if live_seen_snapshot and override_now is None:
         sess_acc = session_accum_secs or {}
         sess_ok  = session_qualified or {}
-        # Work on dicts for edits
         day_map   = {uid: secs for uid, secs in day_rows}
         week_map  = {uid: secs for uid, secs in week_rows}
         month_map = {uid: secs for uid, secs in month_rows}
 
         for raw_uid, join_ts in list(live_seen_snapshot.items()):
-            # Canonicalize uid
             uid = alias_to_canon.get(raw_uid, raw_uid)
-
             active_delta = int(max(0, now_ts - join_ts))
             total_session_so_far = int(sess_acc.get(uid, 0)) + int(sess_acc.get(raw_uid, 0))
             qualified_now = bool(sess_ok.get(uid, False) or (total_session_so_far + active_delta) >= SESSION_MIN_SECONDS)
             if not qualified_now:
-                continue  # still below 5m in this videochat => don't show or add
+                continue
 
             stored_today = db_get_day_seconds(uid, today_str)
             extra_for_today = active_delta
@@ -666,7 +740,6 @@ async def post_leaderboard(
             week_map[uid]  = week_map.get(uid, 0)  + extra_for_today
             month_map[uid] = month_map.get(uid, 0) + extra_for_today
 
-        # Back to sorted lists (drop zeros)
         day_rows   = _unique_sorted(list(day_map.items()))
         week_rows  = _unique_sorted(list(week_map.items()))
         month_rows = _unique_sorted(list(month_map.items()))
@@ -718,6 +791,16 @@ class _State:
     session_accum_secs: dict[int, int] = {}     # uid -> total seconds accrued this session (sum of pending + committed this session)
     session_qualified: dict[int, bool] = {}     # uid -> has crossed SESSION_MIN_SECONDS in this session
 
+    # Quiet logging controls
+    call_active: bool = False
+    last_roster_sig: str = ""
+    last_roster_print_ts: float = 0.0
+
+    # Watchdog / heartbeat
+    start_ts: float = time.time()
+    last_ok_snapshot_ts: float = time.time()
+    incident_thresholds_sent: set[int] = set()
+
 STATE = _State()
 
 def _start_new_session(call_id: int):
@@ -731,7 +814,6 @@ def _start_new_session(call_id: int):
 
 def _finalize_session(now_ts: float):
     """Close all open segments; commit those users who met the 5m gate; drop the rest."""
-    # Close active segments into pending lists
     for uid, start_ts in list(STATE.seen.items()):
         if now_ts > start_ts:
             STATE.pending_segments.setdefault(uid, []).append((start_ts, now_ts))
@@ -751,6 +833,49 @@ def _finalize_session(now_ts: float):
     STATE.current_call_id = None
     print("[session] Ended; committed only qualified users (>=5m).")
 
+# ---------- Watchdog helpers ----------
+async def _notify_admin(text: str):
+    """Send a short DM alert to your main account from the account logged into study_session."""
+    try:
+        await ensure_connected()
+        await client.send_message(WATCHDOG_NOTIFY_TO, f"⚠️ StudyTracker: {text}")
+    except Exception as e:
+        _log_exc("notify failed", e)
+
+def _note_ok_snapshot():
+    """
+    Mark a healthy heartbeat. If we were in an incident (one or more alerts sent),
+    send a single recovery DM and clear the incident state.
+    """
+    was_in_incident = bool(STATE.incident_thresholds_sent)
+    STATE.last_ok_snapshot_ts = time.time()
+    if was_in_incident:
+        try:
+            asyncio.create_task(_notify_admin("it is working again ✅ You are good to go."))
+        except Exception:
+            pass
+        STATE.incident_thresholds_sent.clear()
+
+async def _check_watchdog():
+    """
+    If no successful snapshot for 5/10/15 minutes, send ONE alert at each threshold.
+    After 15 minutes: no more reminders until it recovers (then a single ✅ message).
+    """
+    now = time.time()
+
+    # Avoid false alerts immediately on boot/start
+    if now - STATE.start_ts < HEARTBEAT_THRESHOLDS[0]:
+        return
+
+    elapsed = now - STATE.last_ok_snapshot_ts
+    for thr in HEARTBEAT_THRESHOLDS:
+        if elapsed >= thr and thr not in STATE.incident_thresholds_sent:
+            STATE.incident_thresholds_sent.add(thr)
+            mins = thr // 60
+            await _notify_admin(f"no tracking heartbeat for {mins} minutes. please check the tracker.")
+            break  # only one alert per loop
+
+# ---------- Snapshot ----------
 async def _refresh_snapshot():
     """Fetch current participants and reconcile joins/leaves vs STATE.seen with 5m per-session gate."""
     if not STATE.ent:
@@ -763,7 +888,11 @@ async def _refresh_snapshot():
         if not call:
             if STATE.current_call_id is not None:
                 _finalize_session(now_ts)
-            print("[snapshot] No active call.")
+            if STATE.call_active:  # only print when switching from active -> inactive
+                print("[snapshot] No active call.")
+            STATE.call_active = False
+            STATE.last_roster_sig = ""
+            _note_ok_snapshot()   # record healthy heartbeat even with no active call
             return
         else:
             if STATE.current_call_id is None or STATE.current_call_id != call.id:
@@ -821,19 +950,27 @@ async def _refresh_snapshot():
                         STATE.pending_segments[uid] = []
                         STATE.session_qualified[uid] = True
 
-        # Roster log (show canonical label like @realferuzbek for your aliases)
+        # Roster log (canonical labels) — only on change / every few minutes
+        STATE.call_active = True
         alias_to_canon, canon_label = _alias_maps_from_cache()
-        names_now = []
+        names_now, ids_for_sig = [], []
         for uid, n, _ in participants:
             if not n or (not TRACK_SELF and uid == MY_ID):
                 continue
             cid = alias_to_canon.get(uid, uid)
             label = canon_label.get(cid)
             names_now.append(label if label else n)
+            ids_for_sig.append(str(cid))
 
+        roster_sig = ",".join(sorted(ids_for_sig))
         now_str = datetime.now(TZ).strftime('%H:%M:%S')
-        roster = ", ".join(names_now) if names_now else "—"
-        print(f"[{now_str}] In call ({len(current)}): {roster}")
+        if (roster_sig != STATE.last_roster_sig) or (time.time() - STATE.last_roster_print_ts >= ROSTER_LOG_EVERY):
+            roster = ", ".join(names_now) if names_now else "—"
+            print(f"[{now_str}] In call ({len(set(ids_for_sig))}): {roster}")
+            STATE.last_roster_sig = roster_sig
+            STATE.last_roster_print_ts = time.time()
+
+        _note_ok_snapshot()  # snapshot completed fine
     except Exception as e:
         _log_exc("Snapshot error", e)
 
@@ -878,9 +1015,21 @@ def _month30_block(anchor: datetime, today: datetime):
     end   = start + timedelta(days=29)
     return idx, start, end
 
+# ---------- NEW: catch-up DM on startup (6/6) ----------
+async def _notify_catchup_if_needed():
+    state = _load_state()
+    last = state.get("last_seen")
+    if last:
+        gap = int(_now_ts() - last)
+        if gap > 600:
+            try:
+                await client.send_message(WATCHDOG_NOTIFY_TO, f"Tracker restarted after downtime of ~{gap//60} min.")
+            except Exception:
+                pass
+
 # ---------- Main loop ----------
 async def main():
-    global MY_ID
+    global MY_ID, _last_idle_beat, _last_offline_beat
     assert_session_free()
     db_init()
 
@@ -914,28 +1063,71 @@ async def main():
     # First snapshot immediately (in case call already active)
     await _refresh_snapshot()
 
-    last_posted = db_get_meta("last_post_date")
+    # NEW: catch-up DM if we were down a while (6/6)
+    await _notify_catchup_if_needed()
 
-    # Catch-up daily post on startup (if after time)
+    # --- Backfill any missed days on startup (and today if after 22:00) ---
+    last_posted = db_get_meta("last_post_date")  # ISO string or None
     now = datetime.now(TZ)
-    today_str = now.date().isoformat()
-    if (now.hour, now.minute) >= (POST_HOUR, POST_MINUTE) and last_posted != today_str:
+    today = now.date()
+
+    def _parse_date(s: str | None) -> date | None:
+        if not s: return None
+        try: return datetime.fromisoformat(s).date()
+        except Exception: return None
+
+    lp = _parse_date(last_posted)
+    to_post: list[date] = []
+
+    if lp:
+        d = lp + timedelta(days=1)
+        while d < today:        # all fully missed days before today
+            to_post.append(d)
+            d += timedelta(days=1)
+        if (now.hour, now.minute) >= (POST_HOUR, POST_MINUTE) and lp != today:
+            to_post.append(today)  # also post today immediately if we’re already past 22:00
+    else:
+        # first-ever run: only post immediately if we’re already past 22:00 today
+        if (now.hour, now.minute) >= (POST_HOUR, POST_MINUTE):
+            to_post.append(today)
+
+    for d in to_post:
+        target_dt = datetime(d.year, d.month, d.day, POST_HOUR, POST_MINUTE, tzinfo=TZ)
+        print(f"[catch-up] Backfilling leaderboard for {d.isoformat()}")
         try:
             await post_leaderboard(
                 STATE.ent,
-                live_seen_snapshot=STATE.seen.copy(),
-                session_accum_secs=STATE.session_accum_secs.copy(),
-                session_qualified=STATE.session_qualified.copy(),
-                mark_daily=True
+                live_seen_snapshot=None,
+                session_accum_secs=None,
+                session_qualified=None,
+                mark_daily=True,
+                override_now=target_dt
             )
-            last_posted = today_str
-            print("[catch-up] Posted today’s leaderboard on startup.")
+            last_posted = d.isoformat()
         except Exception as e:
             _log_exc("Catch-up post error", e)
 
-    # Safety snapshot poll + daily post + manual post-now flag
+    # Initialize state file (5/6 – we also update every loop)
+    state = _load_state()
+    state["last_seen"] = _now_ts()
+    _save_state(state)
+
+    # Safety snapshot poll + daily post + manual post-now flag + NEW heartbeats (5/6)
     while True:
-        await ensure_connected()
+        # If offline: emit quiet 1-min heartbeat and skip heavy work
+        if not await ensure_connected():
+            now_ts = _now_ts()
+            if (_last_offline_beat == 0.0) or (now_ts - _last_offline_beat >= HEARTBEAT_OFFLINE_EVERY):
+                _log_beat("offline; waiting for Telegram/network…")
+                _last_offline_beat = now_ts
+                state["last_seen"] = now_ts
+                _save_state(state)
+            await asyncio.sleep(5)
+            continue
+
+        # Connected path (clear offline cadence)
+        _last_offline_beat = 0.0
+
         now = datetime.now(TZ)
         today_str = now.date().isoformat()
 
@@ -947,13 +1139,14 @@ async def main():
                     live_seen_snapshot=STATE.seen.copy(),
                     session_accum_secs=STATE.session_accum_secs.copy(),
                     session_qualified=STATE.session_qualified.copy(),
-                    mark_daily=False   # <— manual posts no longer block the 22:00 auto post
+                    mark_daily=False
                 )
             finally:
                 try: os.remove(CONTROL_POST_NOW_FILE)
                 except Exception: pass
 
         # Daily scheduled post
+        last_posted = db_get_meta("last_post_date")
         if (now.hour, now.minute) >= (POST_HOUR, POST_MINUTE) and last_posted != today_str:
             try:
                 await post_leaderboard(
@@ -969,6 +1162,19 @@ async def main():
 
         # Safety snapshot in case no raw updates arrived recently
         await _refresh_snapshot()
+
+        # NEW: idle heartbeat every 10 min when no livestream (5/6)
+        now_ts = _now_ts()
+        if not STATE.call_active and (_last_idle_beat == 0.0 or (now_ts - _last_idle_beat >= HEARTBEAT_IDLE_EVERY)):
+            _log_beat("In call (0): —")
+            _last_idle_beat = now_ts
+
+        # 5/10/15-min watchdog
+        await _check_watchdog()
+
+        # remember last alive
+        state["last_seen"] = now_ts
+        _save_state(state)
 
         await asyncio.sleep(SNAPSHOT_POLL_EVERY)
 
