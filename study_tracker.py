@@ -10,6 +10,7 @@
 
 import asyncio, time, re, sqlite3, os, sys, traceback, random, html, json
 from datetime import datetime, timedelta, timezone, date
+from pathlib import Path
 
 # ---- Timezone (Asia/Tashkent) with fallback ----
 try:
@@ -32,13 +33,29 @@ try:
 except Exception:
     _ST_MUTEX = None
 
-# ---- Logging ----
 import logging, logging.handlers, builtins
+from logging.handlers import RotatingFileHandler
+import threading
+
+# ---- Logging ----
 logger = logging.getLogger("tracker")
 logger.setLevel(logging.INFO)
-fh = logging.handlers.RotatingFileHandler("tracker.log", maxBytes=2_000_000, backupCount=7, encoding="utf-8")
+
+BASE_DIR = Path(__file__).resolve().parent
+LOG_FILE = BASE_DIR / "tracker.log"
+ROTATED = BASE_DIR / "tracker_2.log"
+HEARTBEAT_FILE = BASE_DIR / "tracker.lock"
+
+fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=1, encoding="utf-8")
+def _namer(default_name: str):
+    # Rename tracker.log.1 -> tracker_2.log
+    p = Path(default_name)
+    return str(ROTATED if p.name.endswith(".1") else p)
+fh.namer = _namer
 fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-logger.addHandler(fh)
+
+logger.handlers = [fh]
+logger.propagate = False
 
 _builtin_print = builtins.print
 def print(*args, **kwargs):
@@ -117,6 +134,27 @@ HEARTBEAT_IDLE_EVERY = int(os.getenv("HEARTBEAT_IDLE_EVERY", "600"))   # 10 min 
 HEARTBEAT_OFFLINE_EVERY = int(os.getenv("HEARTBEAT_OFFLINE_EVERY", "60"))  # 1 min while offline
 STATE_FILE = "tracker_state.json"
 
+HEARTBEAT_SEC = 10   # set to 30 if you prefer
+
+_hb_stop = threading.Event()
+def _heartbeat():
+    import json, time
+    while not _hb_stop.is_set():
+        try:
+            HEARTBEAT_FILE.write_text(str(int(time.time())), encoding="utf-8")
+            # log a compact pulse
+            logger.info("[heartbeat] alive")
+            # also refresh tracker_state.json last_seen for the watchdog
+            try:
+                st = {"last_seen": int(time.time())}
+                Path("tracker_state.json").write_text(json.dumps(st), encoding="utf-8")
+            except Exception:
+                pass
+        except Exception as e:
+            try: logger.warning(f"heartbeat error: {e}")
+            except Exception: pass
+        _hb_stop.wait(HEARTBEAT_SEC)
+
 _last_idle_beat = 0.0
 _last_offline_beat = 0.0
 
@@ -155,6 +193,12 @@ def assert_session_free():
         con.close()
     except sqlite3.OperationalError:
         print("\n[ABORT] Another copy is using the session. Close it first.\n")
+        try:
+            _hb_stop.set()
+            if "_hb_thr" in globals():
+                _hb_thr.join(timeout=2)
+        except Exception:
+            pass
         sys.exit(1)
 
 # ---------- DB helpers ----------
@@ -1029,9 +1073,13 @@ async def _notify_catchup_if_needed():
 
 # ---------- Main loop ----------
 async def main():
-    global MY_ID, _last_idle_beat, _last_offline_beat
+    global MY_ID, _last_idle_beat, _last_offline_beat, _hb_thr
     assert_session_free()
     db_init()
+
+    if "_hb_thr" not in globals():
+        _hb_thr = threading.Thread(target=_heartbeat, name="heartbeat", daemon=True)
+        _hb_thr.start()
 
     try:
         await client.connect()
@@ -1181,4 +1229,10 @@ async def main():
 if __name__ == "__main__":
     try: asyncio.run(main())
     except KeyboardInterrupt:
+        try:
+            _hb_stop.set()
+            if "_hb_thr" in globals():
+                _hb_thr.join(timeout=2)
+        except Exception:
+            pass
         print("\nExiting cleanly. Bye")

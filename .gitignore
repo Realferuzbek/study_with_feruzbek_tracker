@@ -12,3 +12,24 @@ yarn-error.log*
 .env
 .env.*
 !.env.example
+
+# Logs
+runner-*.log
+runner.log
+*.log.*
+!tracker.log
+!tracker_2.log
+
+# Python / local stuff
+pycache/
+*.pyc
+*.pyo
+*.pyd
+*.bak
+*.session
+manual_stop.flag
+.env
+.env.*
+*.db
+!study.db
+node_modules/
