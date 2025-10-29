@@ -8,9 +8,10 @@
 # - Daily auto post at 22:00 Asia/Tashkent
 # - Manual "post now" without breaking daily schedule (post_now.flag)
 
-import asyncio, time, re, sqlite3, os, sys, traceback, random, html, json
+import asyncio, time, re, sqlite3, os, sys, traceback, random, html, json, copy
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
+from typing import List, NamedTuple, Optional
 
 # ---- Timezone (Asia/Tashkent) with fallback ----
 try:
@@ -20,7 +21,11 @@ except Exception:
     TZ = timezone(timedelta(hours=5))  # UTC+5 fallback
 
 from telethon import TelegramClient, functions, types, events
+from telethon.errors import RPCError
+from telethon.extensions import html as tele_html
 from telethon.utils import get_peer_id
+
+from emojis_runtime import NORMAL_SET, PremiumEmojiResolver, has_premium
 
 # ---- Windows single-instance guard (coexists with PS1 mutex) ----
 import ctypes, ctypes.wintypes
@@ -88,7 +93,7 @@ SNAPSHOT_POLL_EVERY  = 30
 FLUSH_EVERY  = 600  # 10 minutes
 
 # Daily post time (Asia/Tashkent)
-POST_HOUR    = 22
+POST_HOUR    = 21
 POST_MINUTE  = 0
 
 DB_PATH      = "study.db"
@@ -666,6 +671,131 @@ def _format_section(label: str, header_right: str, rows, compliments_by_user, na
         lines.append(f"{rank} {name_html} — {mins}m {badge}{tail}")
     return "\n".join(lines)
 
+# ---------- Premium emoji helpers ----------
+class _TokenMatch(NamedTuple):
+    key: str
+    original_start: int
+    original_len: int
+    token_start: int
+    token_len: int
+
+
+_NORMAL_EMOJI_SORTED = sorted(NORMAL_SET.items(), key=lambda kv: len(kv[1]), reverse=True)
+_PREMIUM_LOGGED = False
+
+
+def _tokenize_plain_text(text: str) -> tuple[str, List[_TokenMatch]]:
+    tokens: List[_TokenMatch] = []
+    parts: List[str] = []
+    i = 0
+    new_len = 0
+    while i < len(text):
+        matched: Optional[tuple[str, str]] = None
+        for key, emoji in _NORMAL_EMOJI_SORTED:
+            if text.startswith(emoji, i):
+                matched = (key, emoji)
+                break
+        if matched:
+            key, emoji = matched
+            token = f"{{{key}}}"
+            tokens.append(_TokenMatch(key, i, len(emoji), new_len, len(token)))
+            parts.append(token)
+            new_len += len(token)
+            i += len(emoji)
+        else:
+            ch = text[i]
+            parts.append(ch)
+            new_len += 1
+            i += 1
+    return "".join(parts), tokens
+
+
+def _offset_stage0_to_stage1(tokens: List[_TokenMatch], offset: int) -> Optional[int]:
+    delta = 0
+    for tok in tokens:
+        tok_end = tok.original_start + tok.original_len
+        if offset >= tok_end:
+            delta += tok.token_len - tok.original_len
+            continue
+        if tok.original_start < offset < tok_end:
+            return None
+        break
+    return offset + delta
+
+
+def _offset_stage1_to_stage2(tokens: List[_TokenMatch], offset: int) -> Optional[int]:
+    delta = 0
+    for tok in tokens:
+        tok_end = tok.token_start + tok.token_len
+        if offset >= tok_end:
+            delta += 1 - tok.token_len
+            continue
+        if tok.token_start < offset < tok_end:
+            return None
+        break
+    return offset + delta
+
+
+def _retarget_markup_entities(
+    entities: List[types.TypeMessageEntity],
+    tokens: List[_TokenMatch]
+) -> Optional[List[types.TypeMessageEntity]]:
+    adjusted: List[types.TypeMessageEntity] = []
+    for ent in entities:
+        start = ent.offset
+        end = ent.offset + ent.length
+        stage1_start = _offset_stage0_to_stage1(tokens, start)
+        stage1_end = _offset_stage0_to_stage1(tokens, end)
+        if stage1_start is None or stage1_end is None:
+            return None
+        final_start = _offset_stage1_to_stage2(tokens, stage1_start)
+        final_end = _offset_stage1_to_stage2(tokens, stage1_end)
+        if (
+            final_start is None
+            or final_end is None
+            or final_end < final_start
+        ):
+            return None
+        ent_copy = copy.deepcopy(ent)
+        ent_copy.offset = final_start
+        ent_copy.length = final_end - final_start
+        adjusted.append(ent_copy)
+    return adjusted
+
+
+async def _try_send_premium(client, target, html_text: str) -> bool:
+    global _PREMIUM_LOGGED
+
+    plain_text, markup_entities = tele_html.parse(html_text)
+    tokenized_text, tokens = _tokenize_plain_text(plain_text)
+    if not tokens:
+        return False
+
+    pinned_msg = await PremiumEmojiResolver.refresh_if_changed(client)
+    if not PremiumEmojiResolver.is_ready():
+        await PremiumEmojiResolver.hydrate(client, pinned=pinned_msg)
+    if not PremiumEmojiResolver.is_ready():
+        return False
+
+    rendered_text, emoji_entities = PremiumEmojiResolver.render(tokenized_text)
+    markup_shifted = _retarget_markup_entities(markup_entities, tokens)
+    if markup_shifted is None:
+        raise ValueError("Failed to remap markup entities for premium emojis.")
+
+    formatting_entities = markup_shifted + emoji_entities
+    formatting_entities.sort(key=lambda ent: ent.offset)
+
+    await client.send_message(
+        target,
+        rendered_text,
+        formatting_entities=formatting_entities,
+    )
+
+    if not _PREMIUM_LOGGED:
+        logger.info("premium_emojis=on")
+        _PREMIUM_LOGGED = True
+    return True
+
 # ---------- GROUP CHANGE AUTO-RESET ----------
 def _reset_all_state_for_new_group(new_group_key: str):
     today = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -817,7 +947,25 @@ async def post_leaderboard(
         motd = "\n\n" + _b("WORD OF THE DAY 🌟") + "\n" + f"<blockquote>{quote_html}</blockquote>"
 
     msg = f"{title}\n\n{today_txt}\n\n{week_txt}\n\n{month_txt}{motd}"
-    await client.send_message(ent, msg, parse_mode="html")
+
+    premium_sent = False
+    try:
+        premium_capable = await has_premium(client)
+    except Exception:
+        premium_capable = False
+
+    if premium_capable:
+        try:
+            premium_sent = await _try_send_premium(client, ent, msg)
+        except RPCError:
+            premium_sent = False
+            logger.warning("premium_failed_fallback")
+        except Exception:
+            premium_sent = False
+            logger.warning("premium_failed_fallback")
+
+    if not premium_sent:
+        await client.send_message(ent, msg, parse_mode="html")
     if mark_daily:
         db_set_meta("last_post_date", now.date().isoformat())
     print(f"Posted leaderboard for {now.date().isoformat()} (mark_daily={mark_daily}).")
@@ -1103,7 +1251,7 @@ async def main():
     STATE.ent = await resolve_group(GROUP)
     _maybe_reset_on_group_change(STATE.ent)
 
-    print("Tracker running. Will post automatically at 22:00 Asia/Tashkent.")
+    print("Tracker running. Will post automatically at 21:00 Asia/Tashkent.")
     me = await client.get_me()
     MY_ID = me.id
     print("Running as user id:", MY_ID)
