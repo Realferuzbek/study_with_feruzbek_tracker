@@ -42,6 +42,8 @@ import logging, logging.handlers, builtins
 from logging.handlers import RotatingFileHandler
 import threading
 
+from web_export import export_latest_leaderboards
+
 # ---- Logging ----
 logger = logging.getLogger("tracker")
 logger.setLevel(logging.INFO)
@@ -652,23 +654,51 @@ def _title_with_day(anchor: datetime, today: datetime) -> str:
 def _header_block(label: str, header_right: str) -> str:
     return f"<blockquote>{_b(f'{label} — {header_right}')}</blockquote>"
 
-def _format_section(label: str, header_right: str, rows, compliments_by_user, name_overrides: dict[int,str]):
-    if not rows: return f"{_header_block(label, header_right)}\n{_b('nobody did lessons 😴')}"
-    lines = [ _header_block(label, header_right) ]
+def _section_entries(
+    rows,
+    compliments_by_user: dict[int, str],
+    name_overrides: dict[int, str],
+) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
     for idx, (uid, secs) in enumerate(rows[:SHOW_MAX_PER_LIST], 1):
         mins = _mins(secs)
         preferred = name_overrides.get(uid)
-        name_text = preferred if preferred else fmt_name(uid)
-        name_html = _b(name_text)  # bold username or name
-        rank = _rank_medal(idx) or _rank_keycap(idx)
+        display_name = preferred if preferred else fmt_name(uid)
+        rank_emoji = _rank_medal(idx) or _rank_keycap(idx)
         badge = _badge_for_minutes(mins)
-        tail = ""
+        compliment = ""
         if USE_COMPLIMENTS:
             comp = compliments_by_user.get(uid)
             if comp:
-                comp = _emoji_to_end(comp)  # ensure emoji at the end
-                tail = f" − {_b(comp)}"
-        lines.append(f"{rank} {name_html} — {mins}m {badge}{tail}")
+                compliment = _emoji_to_end(comp)
+        entries.append(
+            {
+                "rank": idx,
+                "user_id": uid,
+                "seconds": int(secs),
+                "minutes": mins,
+                "display": display_name,
+                "rank_emoji": rank_emoji,
+                "badge": badge,
+                "compliment": compliment,
+            }
+        )
+    return entries
+
+
+def _render_section(label: str, header_right: str, entries: list[dict[str, object]]) -> str:
+    if not entries:
+        return f"{_header_block(label, header_right)}\n{_b('nobody did lessons 😴')}"
+    lines = [_header_block(label, header_right)]
+    for entry in entries:
+        name_html = _b(str(entry["display"]))
+        tail = ""
+        compliment = str(entry.get("compliment", "") or "")
+        if compliment:
+            tail = f" − {_b(compliment)}"
+        lines.append(
+            f"{entry['rank_emoji']} {name_html} — {entry['minutes']}m {entry['badge']}{tail}"
+        )
     return "\n".join(lines)
 
 # ---------- Premium emoji helpers ----------
@@ -763,19 +793,19 @@ def _retarget_markup_entities(
     return adjusted
 
 
-async def _try_send_premium(client, target, html_text: str) -> bool:
+async def _try_send_premium(client, target, html_text: str) -> Optional[types.Message]:
     global _PREMIUM_LOGGED
 
     plain_text, markup_entities = tele_html.parse(html_text)
     tokenized_text, tokens = _tokenize_plain_text(plain_text)
     if not tokens:
-        return False
+        return None
 
     pinned_msg = await PremiumEmojiResolver.refresh_if_changed(client)
     if not PremiumEmojiResolver.is_ready():
         await PremiumEmojiResolver.hydrate(client, pinned=pinned_msg)
     if not PremiumEmojiResolver.is_ready():
-        return False
+        return None
 
     rendered_text, emoji_entities = PremiumEmojiResolver.render(tokenized_text)
     markup_shifted = _retarget_markup_entities(markup_entities, tokens)
@@ -785,7 +815,7 @@ async def _try_send_premium(client, target, html_text: str) -> bool:
     formatting_entities = markup_shifted + emoji_entities
     formatting_entities.sort(key=lambda ent: ent.offset)
 
-    await client.send_message(
+    message = await client.send_message(
         target,
         rendered_text,
         formatting_entities=formatting_entities,
@@ -794,7 +824,7 @@ async def _try_send_premium(client, target, html_text: str) -> bool:
     if not _PREMIUM_LOGGED:
         logger.info("premium_emojis=on")
         _PREMIUM_LOGGED = True
-    return True
+    return message
 
 # ---------- GROUP CHANGE AUTO-RESET ----------
 def _reset_all_state_for_new_group(new_group_key: str):
@@ -935,9 +965,13 @@ async def post_leaderboard(
     week_hdr  = f"{_format_d(w_start)} - {_format_d(w_end)} (WEEK {week_idx})"
     month_hdr = f"{_format_d(m_start)} - {_format_d(m_end)} (MONTH {month_idx})"
 
-    today_txt = _format_section("📅 Today",      today_hdr,  day_rows,  day_comps,  canon_label)
-    week_txt  = _format_section("📆 This Week",  week_hdr,   week_rows, week_comps, canon_label)
-    month_txt = _format_section("🗓️ This Month", month_hdr,  month_rows, month_comps, canon_label)
+    day_entries = _section_entries(day_rows, day_comps, canon_label)
+    week_entries = _section_entries(week_rows, week_comps, canon_label)
+    month_entries = _section_entries(month_rows, month_comps, canon_label)
+
+    today_txt = _render_section("📅 Today", today_hdr, day_entries)
+    week_txt = _render_section("📆 This Week", week_hdr, week_entries)
+    month_txt = _render_section("🗓️ This Month", month_hdr, month_entries)
 
     # WORD OF THE DAY — only the quote inside the spoiler
     q = _quote_for_today(now)
@@ -948,7 +982,7 @@ async def post_leaderboard(
 
     msg = f"{title}\n\n{today_txt}\n\n{week_txt}\n\n{month_txt}{motd}"
 
-    premium_sent = False
+    premium_message: types.Message | None = None
     try:
         premium_capable = await has_premium(client)
     except Exception:
@@ -956,19 +990,58 @@ async def post_leaderboard(
 
     if premium_capable:
         try:
-            premium_sent = await _try_send_premium(client, ent, msg)
+            premium_message = await _try_send_premium(client, ent, msg)
         except RPCError:
-            premium_sent = False
+            premium_message = None
             logger.warning("premium_failed_fallback")
         except Exception:
-            premium_sent = False
+            premium_message = None
             logger.warning("premium_failed_fallback")
 
-    if not premium_sent:
-        await client.send_message(ent, msg, parse_mode="html")
+    if premium_message is not None:
+        sent_message = premium_message
+    else:
+        sent_message = await client.send_message(ent, msg, parse_mode="html")
     if mark_daily:
         db_set_meta("last_post_date", now.date().isoformat())
     print(f"Posted leaderboard for {now.date().isoformat()} (mark_daily={mark_daily}).")
+
+    try:
+        chat_id = int(get_peer_id(ent))
+    except Exception:
+        chat_id = getattr(getattr(sent_message, "peer_id", None), "channel_id", None)
+    snapshot = {
+        "posted_at": datetime.now(timezone.utc).isoformat(),
+        "message_id": getattr(sent_message, "id", None),
+        "chat_id": chat_id,
+        "boards": [
+            {
+                "scope": "day",
+                "title": "📅 Today",
+                "header": today_hdr,
+                "period_start": t_start.isoformat(),
+                "period_end": t_end.isoformat(),
+                "entries": [dict(entry) for entry in day_entries],
+            },
+            {
+                "scope": "week",
+                "title": "📆 This Week",
+                "header": week_hdr,
+                "period_start": w_start.isoformat(),
+                "period_end": w_end.isoformat(),
+                "entries": [dict(entry) for entry in week_entries],
+            },
+            {
+                "scope": "month",
+                "title": "🗓️ This Month",
+                "header": month_hdr,
+                "period_start": m_start.isoformat(),
+                "period_end": m_end.isoformat(),
+                "entries": [dict(entry) for entry in month_entries],
+            },
+        ],
+    }
+    export_latest_leaderboards(snapshot)
 
 # ---------- Event-driven participant tracking ----------
 class _State:
