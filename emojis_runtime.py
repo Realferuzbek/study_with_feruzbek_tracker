@@ -253,13 +253,14 @@ class PremiumEmojiResolver:
         return {k: int(v) for k, v in emojis.items()}
 
     @classmethod
-    def render(cls, text_with_tokens: str) -> Tuple[str, List[types.TypeMessageEntity]]:
+    def render(cls, text_with_tokens: str) -> Tuple[str, List[types.TypeMessageEntity], List[int]]:
         """
         Replace {KEY} tokens with placeholder glyphs and build custom emoji entities.
         """
         cache = cls._emoji_cache()
         rendered_parts: List[str] = []
         entities: List[types.TypeMessageEntity] = []
+        final_lengths: List[int] = []
         i = 0
         current_len = 0
 
@@ -282,17 +283,19 @@ class PremiumEmojiResolver:
                         )
                     )
                     current_len += 1
+                    final_lengths.append(1)
                 else:
                     fallback = NORMAL_SET.get(key, "")
                     rendered_parts.append(fallback)
                     current_len += len(fallback)
+                    final_lengths.append(len(fallback))
                 i = end + 1
             else:
                 rendered_parts.append(ch)
                 current_len += 1
                 i += 1
 
-        return "".join(rendered_parts), entities
+        return "".join(rendered_parts), entities, final_lengths
 
 
 async def has_premium(client) -> bool:

@@ -753,12 +753,17 @@ def _offset_stage0_to_stage1(tokens: List[_TokenMatch], offset: int) -> Optional
     return offset + delta
 
 
-def _offset_stage1_to_stage2(tokens: List[_TokenMatch], offset: int) -> Optional[int]:
+def _offset_stage1_to_stage2(
+    tokens: List[_TokenMatch],
+    offset: int,
+    final_lengths: List[int],
+) -> Optional[int]:
     delta = 0
-    for tok in tokens:
+    for idx, tok in enumerate(tokens):
         tok_end = tok.token_start + tok.token_len
         if offset >= tok_end:
-            delta += 1 - tok.token_len
+            replacement_len = final_lengths[idx] if idx < len(final_lengths) else 0
+            delta += replacement_len - tok.token_len
             continue
         if tok.token_start < offset < tok_end:
             return None
@@ -768,7 +773,8 @@ def _offset_stage1_to_stage2(tokens: List[_TokenMatch], offset: int) -> Optional
 
 def _retarget_markup_entities(
     entities: List[types.TypeMessageEntity],
-    tokens: List[_TokenMatch]
+    tokens: List[_TokenMatch],
+    final_lengths: List[int],
 ) -> Optional[List[types.TypeMessageEntity]]:
     adjusted: List[types.TypeMessageEntity] = []
     for ent in entities:
@@ -778,8 +784,8 @@ def _retarget_markup_entities(
         stage1_end = _offset_stage0_to_stage1(tokens, end)
         if stage1_start is None or stage1_end is None:
             return None
-        final_start = _offset_stage1_to_stage2(tokens, stage1_start)
-        final_end = _offset_stage1_to_stage2(tokens, stage1_end)
+        final_start = _offset_stage1_to_stage2(tokens, stage1_start, final_lengths)
+        final_end = _offset_stage1_to_stage2(tokens, stage1_end, final_lengths)
         if (
             final_start is None
             or final_end is None
@@ -793,29 +799,29 @@ def _retarget_markup_entities(
     return adjusted
 
 
-async def _try_send_premium(client, target, html_text: str) -> Optional[types.Message]:
+async def _try_send_premium(client, target, html_text: str) -> bool:
     global _PREMIUM_LOGGED
 
     plain_text, markup_entities = tele_html.parse(html_text)
     tokenized_text, tokens = _tokenize_plain_text(plain_text)
     if not tokens:
-        return None
+        return False
 
     pinned_msg = await PremiumEmojiResolver.refresh_if_changed(client)
     if not PremiumEmojiResolver.is_ready():
         await PremiumEmojiResolver.hydrate(client, pinned=pinned_msg)
     if not PremiumEmojiResolver.is_ready():
-        return None
+        return False
 
-    rendered_text, emoji_entities = PremiumEmojiResolver.render(tokenized_text)
-    markup_shifted = _retarget_markup_entities(markup_entities, tokens)
+    rendered_text, emoji_entities, final_lengths = PremiumEmojiResolver.render(tokenized_text)
+    markup_shifted = _retarget_markup_entities(markup_entities, tokens, final_lengths)
     if markup_shifted is None:
         raise ValueError("Failed to remap markup entities for premium emojis.")
 
     formatting_entities = markup_shifted + emoji_entities
     formatting_entities.sort(key=lambda ent: ent.offset)
 
-    message = await client.send_message(
+    await client.send_message(
         target,
         rendered_text,
         formatting_entities=formatting_entities,
@@ -824,7 +830,7 @@ async def _try_send_premium(client, target, html_text: str) -> Optional[types.Me
     if not _PREMIUM_LOGGED:
         logger.info("premium_emojis=on")
         _PREMIUM_LOGGED = True
-    return message
+    return True
 
 # ---------- GROUP CHANGE AUTO-RESET ----------
 def _reset_all_state_for_new_group(new_group_key: str):
