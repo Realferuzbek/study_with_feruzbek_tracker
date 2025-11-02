@@ -115,10 +115,14 @@ class PremiumEmojiResolver:
     @classmethod
     def is_ready(cls) -> bool:
         cls._load_cache()
-        emojis = cls._cache_data.get("emojis", {})
-        if not emojis:
-            return False
-        return all(key in emojis for key in NORMAL_SET)
+        data = cls._cache_data
+        emojis = data.get("emojis", {})
+        if emojis:
+            return True
+        # Treat the resolver as ready once we've successfully inspected the pinned
+        # message (even if it contained only standard Unicode emoji), so the caller
+        # can still render using the normal set without bailing out.
+        return data.get("pinned_id") is not None or data.get("content_hash") is not None
 
     @classmethod
     async def hydrate(cls, client, pinned: Optional[types.Message] = None) -> None:
