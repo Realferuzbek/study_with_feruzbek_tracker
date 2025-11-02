@@ -115,10 +115,14 @@ class PremiumEmojiResolver:
     @classmethod
     def is_ready(cls) -> bool:
         cls._load_cache()
-        emojis = cls._cache_data.get("emojis", {})
-        if not emojis:
-            return False
-        return all(key in emojis for key in NORMAL_SET)
+        data = cls._cache_data
+        emojis = data.get("emojis", {})
+        if emojis and all(key in emojis for key in NORMAL_SET):
+            return True
+        # Treat the resolver as ready once we've successfully parsed the pinned
+        # message (even if it only supplied standard emoji). Missing keys fall back
+        # to NORMAL_SET during rendering.
+        return data.get("pinned_id") is not None and data.get("content_hash") is not None
 
 
     @classmethod
