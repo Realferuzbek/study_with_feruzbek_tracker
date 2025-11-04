@@ -11,7 +11,7 @@
 import asyncio, time, re, sqlite3, os, sys, traceback, random, html, json, copy
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
-from typing import List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple, Optional
 
 # ---- Timezone (Asia/Tashkent) with fallback ----
 try:
@@ -21,7 +21,7 @@ except Exception:
     TZ = timezone(timedelta(hours=5))  # UTC+5 fallback
 
 from telethon import TelegramClient, functions, types, events
-from telethon.errors import RPCError
+from telethon.errors import RPCError, FloodWaitError
 from telethon.extensions import html as tele_html
 from telethon.utils import get_peer_id
 
@@ -46,7 +46,8 @@ from web_export import export_latest_leaderboards
 
 # ---- Logging ----
 logger = logging.getLogger("tracker")
-logger.setLevel(logging.INFO)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_FILE = BASE_DIR / "tracker.log"
@@ -120,6 +121,18 @@ SESSION_MIN_SECONDS = 300
 # Daily minimum for inclusion is now disabled (session gate handles fairness)
 MIN_DAILY_SECONDS = 0
 
+HYDRATE_INTERVAL_MIN = max(int(os.getenv("HYDRATE_INTERVAL_MIN", "10")), 1)
+HYDRATE_INTERVAL_SEC = HYDRATE_INTERVAL_MIN * 60
+EMOJI_STATUS_INTERVAL_SEC = 24 * 60 * 60
+_ADMIN_CHAT_ENV = os.getenv("ADMIN_CHAT_ID")
+if _ADMIN_CHAT_ENV:
+    try:
+        ADMIN_CHAT_ID = int(_ADMIN_CHAT_ENV)
+    except ValueError:
+        ADMIN_CHAT_ID = _ADMIN_CHAT_ENV.strip()
+else:
+    ADMIN_CHAT_ID = None
+
 # ---- Alias groups (merge these usernames as one person, shown as the canonical) ----
 # canonical_username: [canonical_username, alias1, alias2, ...]
 ALIAS_GROUPS_USERNAMES = {
@@ -135,6 +148,16 @@ HEARTBEAT_THRESHOLDS = [300, 600, 900]   # alert at 5, 10, 15 minutes since last
 
 client = TelegramClient(SESSION, API_ID, API_HASH)
 MY_ID: int | None = None
+
+async def _send_message_with_retry(target, *args, **kwargs):
+    try:
+        return await client.send_message(target, *args, **kwargs)
+    except FloodWaitError as fw:
+        wait = int(getattr(fw, "seconds", 1)) + 1
+        logger.warning("FloodWait %s s encountered; retrying once", wait)
+        await asyncio.sleep(wait)
+        return await client.send_message(target, *args, **kwargs)
+
 
 # ---------- NEW: Heartbeat / state (1/6) ----------
 HEARTBEAT_IDLE_EVERY = int(os.getenv("HEARTBEAT_IDLE_EVERY", "600"))   # 10 min when no livestream
@@ -710,6 +733,14 @@ class _TokenMatch(NamedTuple):
     token_len: int
 
 
+class PreviewResult(NamedTuple):
+    message_text: str
+    explain_table: str
+    per_key_sources: Dict[str, str]
+    breakdown: Dict[str, List[str]]
+    mode: str
+
+
 _NORMAL_EMOJI_SORTED = sorted(NORMAL_SET.items(), key=lambda kv: len(kv[1]), reverse=True)
 _PREMIUM_LOGGED = False
 
@@ -807,13 +838,11 @@ async def _try_send_premium(client, target, html_text: str) -> bool:
     if not tokens:
         return False
 
-    pinned_msg = await PremiumEmojiResolver.refresh_if_changed(client)
-    if not PremiumEmojiResolver.is_ready():
-        await PremiumEmojiResolver.hydrate(client, pinned=pinned_msg)
-    if not PremiumEmojiResolver.is_ready():
-        return False
+    await PremiumEmojiResolver.refresh_if_needed(client)
+    if not PremiumEmojiResolver.last_refresh_success():
+        logger.warning('emoji hydrate failed before posting; using cached data')
 
-    rendered_text, emoji_entities, final_lengths = PremiumEmojiResolver.render(tokenized_text)
+    rendered_text, emoji_entities, final_lengths, _ = PremiumEmojiResolver.render_with_sources(tokenized_text)
     markup_shifted = _retarget_markup_entities(markup_entities, tokens, final_lengths)
     if markup_shifted is None:
         raise ValueError("Failed to remap markup entities for premium emojis.")
@@ -821,7 +850,7 @@ async def _try_send_premium(client, target, html_text: str) -> bool:
     formatting_entities = markup_shifted + emoji_entities
     formatting_entities.sort(key=lambda ent: ent.offset)
 
-    await client.send_message(
+    await _send_message_with_retry(
         target,
         rendered_text,
         formatting_entities=formatting_entities,
@@ -892,20 +921,17 @@ def _fold_alias_rows(rows, alias_to_canon):
     return _unique_sorted(list(merged.items()))
 
 # ---------- Leaderboard post ----------
-async def post_leaderboard(
-    ent,
+async def _build_leaderboard_context(
     live_seen_snapshot: dict[int, float] | None = None,
     session_accum_secs: dict[int, int] | None = None,
     session_qualified: dict[int, bool] | None = None,
-    mark_daily: bool = True,             # only auto/backfill should mark the day
-    override_now: datetime | None = None # ← NEW: post for a specific calendar day
+    override_now: datetime | None = None,
 ):
     await ensure_connected()
     now = override_now or datetime.now(TZ)
     now_ts = time.time()
     anchor = _ensure_anchor()
 
-    # Build alias maps (merge your accounts)
     alias_to_canon, canon_label = _alias_maps_from_cache()
 
     week_idx, w_start, w_end = _week_block(anchor, now)
@@ -915,17 +941,14 @@ async def post_leaderboard(
     t_end   = datetime(now.year, now.month, now.day, 23, 59, 59, tzinfo=TZ)
     today_str = now.date().isoformat()
 
-    # SQL totals (no daily gate; zeros filtered)
     day_rows   = _unique_sorted(db_fetch_period_seconds(t_start, t_end,   min_daily=MIN_DAILY_SECONDS))
     week_rows  = _unique_sorted(db_fetch_period_seconds(w_start,  w_end,  min_daily=MIN_DAILY_SECONDS))
     month_rows = _unique_sorted(db_fetch_period_seconds(m_start, m_end,   min_daily=MIN_DAILY_SECONDS))
 
-    # Merge aliases on DB rows
     day_rows   = _fold_alias_rows(day_rows, alias_to_canon)
     week_rows  = _fold_alias_rows(week_rows, alias_to_canon)
     month_rows = _fold_alias_rows(month_rows, alias_to_canon)
 
-    # Adjust with live extras — only if current session meets 5m threshold (only for "now")
     if live_seen_snapshot and override_now is None:
         sess_acc = session_accum_secs or {}
         sess_ok  = session_qualified or {}
@@ -954,7 +977,6 @@ async def post_leaderboard(
         week_rows  = _unique_sorted(list(week_map.items()))
         month_rows = _unique_sorted(list(month_map.items()))
 
-    # Compliments (by canonical id)
     week_comps, month_comps, day_comps = {}, {}, {}
     if USE_COMPLIMENTS:
         for uid, _ in week_rows[:SHOW_MAX_PER_LIST]:
@@ -979,7 +1001,6 @@ async def post_leaderboard(
     week_txt = _render_section("📆 This Week", week_hdr, week_entries)
     month_txt = _render_section("🗓️ This Month", month_hdr, month_entries)
 
-    # WORD OF THE DAY — only the quote inside the spoiler
     q = _quote_for_today(now)
     motd = ""
     if q:
@@ -987,6 +1008,59 @@ async def post_leaderboard(
         motd = "\n\n" + _b("WORD OF THE DAY 🌟") + "\n" + f"<blockquote>{quote_html}</blockquote>"
 
     msg = f"{title}\n\n{today_txt}\n\n{week_txt}\n\n{month_txt}{motd}"
+
+    return {
+        "now": now,
+        "anchor": anchor,
+        "msg": msg,
+        "title": title,
+        "today_hdr": today_hdr,
+        "week_hdr": week_hdr,
+        "month_hdr": month_hdr,
+        "motd": motd,
+        "day_entries": day_entries,
+        "week_entries": week_entries,
+        "month_entries": month_entries,
+        "t_start": t_start,
+        "t_end": t_end,
+        "w_start": w_start,
+        "w_end": w_end,
+        "m_start": m_start,
+        "m_end": m_end,
+        "week_idx": week_idx,
+        "month_idx": month_idx,
+    }
+
+async def post_leaderboard(
+    ent,
+    live_seen_snapshot: dict[int, float] | None = None,
+    session_accum_secs: dict[int, int] | None = None,
+    session_qualified: dict[int, bool] | None = None,
+    mark_daily: bool = True,             # only auto/backfill should mark the day
+    override_now: datetime | None = None # ← NEW: post for a specific calendar day
+):
+    context = await _build_leaderboard_context(
+        live_seen_snapshot=live_seen_snapshot,
+        session_accum_secs=session_accum_secs,
+        session_qualified=session_qualified,
+        override_now=override_now,
+    )
+    await PremiumEmojiResolver.refresh_if_needed(client)
+
+    msg = context["msg"]
+    now = context["now"]
+    today_hdr = context["today_hdr"]
+    week_hdr = context["week_hdr"]
+    month_hdr = context["month_hdr"]
+    day_entries = context["day_entries"]
+    week_entries = context["week_entries"]
+    month_entries = context["month_entries"]
+    t_start = context["t_start"]
+    t_end = context["t_end"]
+    w_start = context["w_start"]
+    w_end = context["w_end"]
+    m_start = context["m_start"]
+    m_end = context["m_end"]
 
     premium_message: types.Message | None = None
     try:
@@ -1007,10 +1081,18 @@ async def post_leaderboard(
     if premium_message is not None:
         sent_message = premium_message
     else:
-        sent_message = await client.send_message(ent, msg, parse_mode="html")
+        sent_message = await _send_message_with_retry(ent, msg, parse_mode="html")
     if mark_daily:
         db_set_meta("last_post_date", now.date().isoformat())
     print(f"Posted leaderboard for {now.date().isoformat()} (mark_daily={mark_daily}).")
+
+    breakdown = PremiumEmojiResolver.resolution_breakdown()
+    counts = PremiumEmojiResolver.counts()
+    if counts.get('mapped_premium', 0) == 0:
+        logger.info('premium map empty (no custom emoji ids)')
+    mode = PremiumEmojiResolver.resolution_mode()
+    missing = breakdown.get('FALLING_BACK', [])
+    logger.info('post_sent emoji_mode=%s missing_keys=%s cache_fingerprint=%s', mode, missing, PremiumEmojiResolver.fingerprint_short())
 
     try:
         chat_id = int(get_peer_id(ent))
@@ -1048,6 +1130,157 @@ async def post_leaderboard(
         ],
     }
     export_latest_leaderboards(snapshot)
+
+async def render_preview(
+    live_seen_snapshot: dict[int, float] | None = None,
+    session_accum_secs: dict[int, int] | None = None,
+    session_qualified: dict[int, bool] | None = None,
+    override_now: datetime | None = None,
+) -> PreviewResult:
+    """
+    Build the leaderboard text without sending and explain per-key emoji sources.
+    """
+    context = await _build_leaderboard_context(
+        live_seen_snapshot=live_seen_snapshot,
+        session_accum_secs=session_accum_secs,
+        session_qualified=session_qualified,
+        override_now=override_now,
+    )
+    html_text = context["msg"]
+    plain_text, _ = tele_html.parse(html_text)
+    tokenized_text, _ = _tokenize_plain_text(plain_text)
+
+    await PremiumEmojiResolver.refresh_if_needed(client)
+
+    rendered_text, _, _, _ = PremiumEmojiResolver.render_with_sources(tokenized_text)
+    per_key_sources = PremiumEmojiResolver.per_key_sources()
+    breakdown = PremiumEmojiResolver.resolution_breakdown()
+    mode = PremiumEmojiResolver.resolution_mode()
+
+    widest_key = max((len(key) for key in per_key_sources), default=1)
+    header = f"{'KEY'.ljust(widest_key)} | SOURCE"
+    divider = "-" * len(header)
+    rows = [header, divider]
+    for key in sorted(per_key_sources):
+        rows.append(f"{key.ljust(widest_key)} | {per_key_sources[key]}")
+    explain_table = "\n".join(rows)
+
+    return PreviewResult(
+        message_text=rendered_text,
+        explain_table=explain_table,
+        per_key_sources=per_key_sources,
+        breakdown=breakdown,
+        mode=mode,
+    )
+
+
+async def _periodic_emoji_refresh():
+    while True:
+        try:
+            changed = await PremiumEmojiResolver.refresh_if_needed(client)
+            if not PremiumEmojiResolver.last_refresh_success():
+                logger.warning("emoji hydrate attempt failed; using cached data")
+            elif changed:
+                logger.info("emoji_cache_refreshed fingerprint=%s", PremiumEmojiResolver.fingerprint_short())
+        except Exception as exc:
+            _log_exc("emoji_periodic_refresh", exc)
+        await asyncio.sleep(HYDRATE_INTERVAL_SEC)
+
+
+async def _periodic_emoji_report():
+    while True:
+        await asyncio.sleep(EMOJI_STATUS_INTERVAL_SEC)
+        try:
+            _log_emoji_counts("emoji_counts_periodic")
+        except Exception as exc:
+            _log_exc("emoji_periodic_report", exc)
+
+
+def _log_emoji_counts(label: str) -> None:
+    breakdown = PremiumEmojiResolver.resolution_breakdown()
+    counts = PremiumEmojiResolver.counts()
+    missing = breakdown.get("FALLING_BACK", [])
+    logger.info("%s mapped_premium=%d pinned_unicode=%d normal_fallback=%d missing_keys=%s fingerprint=%s",
+                label,
+                counts.get("mapped_premium", 0),
+                counts.get("pinned_unicode", 0),
+                counts.get("normal_fallback", 0),
+                missing,
+                PremiumEmojiResolver.fingerprint_short())
+
+
+async def _admin_post_now(chat_id):
+    try:
+        if STATE.ent is None:
+            raise RuntimeError("Target entity not ready yet")
+        await post_leaderboard(STATE.ent, mark_daily=False)
+        await _send_message_with_retry(chat_id, "Manual leaderboard post completed.")
+    except Exception as exc:
+        await _send_message_with_retry(chat_id, f"Manual post failed: {exc}")
+
+
+async def _handle_admin_command(event):
+    text = (event.raw_text or '').strip()
+    if not text.startswith('.'):
+        return
+    lowered = text.lower()
+    if lowered.startswith('.emoji'):
+        parts = text.split(maxsplit=1)
+        if len(parts) == 1:
+            await event.respond('Usage: .emoji status|refresh')
+            return
+        action = parts[1].strip().lower()
+        if action == 'status':
+            await PremiumEmojiResolver.refresh_if_needed(client)
+            counts = PremiumEmojiResolver.counts()
+            breakdown = PremiumEmojiResolver.resolution_breakdown()
+            preview = await render_preview()
+            table_lines = preview.explain_table.splitlines()[:10]
+            response = (
+                f"emoji_mode: {preview.mode}\n"
+                f"fingerprint: {PremiumEmojiResolver.fingerprint_short()}\n"
+                f"counts: premium={counts['mapped_premium']} unicode={counts['pinned_unicode']} normal={counts['normal_fallback']}\n"
+                f"missing: {', '.join(breakdown.get('FALLING_BACK', [])) or '(none)'}\n\n"
+                + "\n".join(table_lines)
+            )
+
+            await event.respond(response)
+            return
+        if action == 'refresh':
+            changed = await PremiumEmojiResolver.refresh_if_needed(client, force=True)
+            if not PremiumEmojiResolver.last_refresh_success():
+                await event.respond('Hydrate failed; using previous cache.')
+            else:
+                status = 'updated' if changed else 'unchanged'
+                await event.respond(f'Hydrate {status}. fingerprint={PremiumEmojiResolver.fingerprint_short()}')
+            return
+        await event.respond('Unknown .emoji command.')
+        return
+    if lowered == '.post now':
+        await event.respond('Manual leaderboard post scheduled.')
+        asyncio.create_task(_admin_post_now(event.chat_id))
+        return
+    if lowered.startswith('.logs tail'):
+        parts = text.split()
+        count = 50
+        if len(parts) == 3 and parts[2].isdigit():
+            count = int(parts[2])
+        try:
+            lines = LOG_FILE.read_text(encoding='utf-8').splitlines()
+            tail = lines[-count:] if count > 0 else lines
+            snippet = '\n'.join(tail)[-3500:]
+            if not snippet:
+                snippet = '(log empty)'
+            await event.respond(snippet)
+        except Exception as exc:
+            await event.respond(f'Failed to read log: {exc}')
+        return
+    await event.respond('Unknown admin command.')
+
+
+if ADMIN_CHAT_ID is not None:
+    client.add_event_handler(_handle_admin_command, events.NewMessage(from_users=ADMIN_CHAT_ID))
+
 
 # ---------- Event-driven participant tracking ----------
 class _State:
@@ -1329,6 +1562,16 @@ async def main():
 
     STATE.ent = await resolve_group(GROUP)
     _maybe_reset_on_group_change(STATE.ent)
+
+    hydrate_status = await PremiumEmojiResolver.refresh_if_needed(client, force=True)
+    if not PremiumEmojiResolver.last_refresh_success():
+        logger.warning('emoji hydrate failed on startup; using cached data')
+    else:
+        status = 'updated' if hydrate_status else 'unchanged'
+        logger.info('emoji hydrate startup status=%s fingerprint=%s', status, PremiumEmojiResolver.fingerprint_short())
+    _log_emoji_counts('emoji_counts_startup')
+    asyncio.create_task(_periodic_emoji_refresh())
+    asyncio.create_task(_periodic_emoji_report())
 
     print("Tracker running. Will post automatically at 21:00 Asia/Tashkent.")
     me = await client.get_me()
