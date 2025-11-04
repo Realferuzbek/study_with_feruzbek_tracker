@@ -2,6 +2,8 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
+import os
 import re
 import time
 from datetime import datetime
@@ -9,6 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from telethon import functions, types
+
+logger = logging.getLogger(__name__)
 
 # These keys map 1:1 with the Unicode glyphs currently sent by the tracker.
 NORMAL_SET: Dict[str, str] = {
@@ -50,6 +54,12 @@ NORMAL_SET: Dict[str, str] = {
     "KEYCAP_8": "8️⃣",
     "KEYCAP_9": "9️⃣",
     "KEYCAP_10": "🔟",
+    "QUOTE_L": "\u201C",
+    "QUOTE_R": "\u201D",
+    "EM_DASH": " \u2014 ",
+    "RANGE_SEP": " - ",
+    "BULLET": "",
+    "WOTD_MARK": "\U0001F31F",
 }
 
 
@@ -58,8 +68,9 @@ class PremiumEmojiResolver:
     Resolves custom emoji document IDs for premium users by reading the pinned
     message in Saved Messages. Results are cached on disk.
     """
-
-    _SCHEMA_VERSION = 2
+    _ALLOWED_POLICIES = {"pinned_strict", "pinned_prefer", "code_only"}
+    _DEFAULT_POLICY = "code_only"
+    _SCHEMA_VERSION = 3
     _cache_path = Path(__file__).with_name("premium_emoji_cache.json")
     _lock = asyncio.Lock()
     _placeholder = "■"
@@ -71,11 +82,15 @@ class PremiumEmojiResolver:
         "fingerprint": None,
         "pinned_message_id": None,
         "items": {},
+        "duplicates": {},
     }
     _cache_loaded: bool = False
     _cache_stale: bool = True
     _last_refresh_ts: float = 0.0
     _last_refresh_success: bool = True
+    _policy: str = _DEFAULT_POLICY
+    _policy_source: str = "default"  # default | env | runtime | auto
+    _premium_detected: Optional[bool] = None
 
     @classmethod
     def _default_cache(cls) -> Dict[str, Any]:
@@ -85,7 +100,76 @@ class PremiumEmojiResolver:
             "fingerprint": None,
             "pinned_message_id": None,
             "items": {},
+            "duplicates": {},
         }
+
+    @classmethod
+    def _normalize_policy(cls, policy: str) -> str:
+        normalized = (policy or "").strip().lower()
+        if normalized not in cls._ALLOWED_POLICIES:
+            raise ValueError(f"Invalid emoji policy: {policy}")
+        return normalized
+
+    @classmethod
+    def set_policy(cls, policy: str, source: str = "runtime") -> str:
+        normalized = cls._normalize_policy(policy)
+        previous = cls._policy
+        if normalized != previous or cls._policy_source != source:
+            cls._policy = normalized
+            cls._policy_source = source
+            logger.info("emoji_policy_set policy=%s source=%s previous=%s", normalized, source, previous)
+        return previous
+
+    @classmethod
+    def current_policy(cls) -> str:
+        return cls._policy
+
+    @classmethod
+    def policy_source(cls) -> str:
+        return cls._policy_source
+
+    @classmethod
+    def premium_status(cls) -> Optional[bool]:
+        return cls._premium_detected
+
+    @classmethod
+    def register_premium_status(cls, premium: Optional[bool]) -> None:
+        detected = None if premium is None else bool(premium)
+        previous = cls._premium_detected
+        cls._premium_detected = detected
+        if detected != previous:
+            logger.info(
+                "emoji_premium_status premium=%s previous=%s policy=%s source=%s",
+                detected,
+                previous,
+                cls._policy,
+                cls._policy_source,
+            )
+        if cls._policy_source in ("default", "auto"):
+            if detected is True:
+                desired = "pinned_strict"
+            elif detected is False:
+                desired = "code_only"
+            else:
+                desired = cls._DEFAULT_POLICY
+            if desired != cls._policy:
+                cls._policy = desired
+                cls._policy_source = "auto"
+                logger.info(
+                    "emoji_policy_auto policy=%s premium=%s",
+                    desired,
+                    detected,
+                )
+
+    @classmethod
+    def _apply_env_policy(cls) -> None:
+        env_policy = os.environ.get("EMOJI_POLICY")
+        if not env_policy:
+            return
+        try:
+            cls.set_policy(env_policy, source="env")
+        except ValueError:
+            logger.warning("Ignoring invalid EMOJI_POLICY value: %s", env_policy)
 
     @classmethod
     def _load_cache(cls) -> None:
@@ -97,13 +181,14 @@ class PremiumEmojiResolver:
                 raise ValueError("cache payload not a dict")
             schema_version = data.get("schema_version")
             if schema_version == cls._SCHEMA_VERSION:
-                items = cls._parse_v4_entries(data.get("items"))
+                items = cls._parse_schema_entries(data.get("items"))
                 cls._cache_data = {
                     "schema_version": cls._SCHEMA_VERSION,
                     "updated_at": data.get("updated_at"),
                     "fingerprint": data.get("fingerprint"),
                     "pinned_message_id": data.get("pinned_message_id"),
                     "items": items,
+                    "duplicates": cls._parse_duplicates(data.get("duplicates")),
                 }
                 cls._cache_stale = False
             else:
@@ -114,6 +199,7 @@ class PremiumEmojiResolver:
                     "fingerprint": data.get("fingerprint"),
                     "pinned_message_id": data.get("pinned_message_id"),
                     "items": migrated_items,
+                    "duplicates": {},
                 }
                 cls._cache_stale = True
         except FileNotFoundError:
@@ -138,7 +224,7 @@ class PremiumEmojiResolver:
                 premium_id = value.get("premium_id")
                 if premium_id is not None:
                     try:
-                        entry_payload["premium_id"] = int(premium_id)
+                        entry_payload["premium_id"] = str(int(premium_id))
                     except (TypeError, ValueError):
                         pass
                 unicode_val = value.get("unicode")
@@ -152,6 +238,7 @@ class PremiumEmojiResolver:
             "fingerprint": cls._cache_data.get("fingerprint"),
             "pinned_message_id": cls._cache_data.get("pinned_message_id"),
             "items": entries_payload,
+            "duplicates": cls._cache_data.get("duplicates") or {},
         }
         try:
             cls._atomic_write(payload)
@@ -163,11 +250,11 @@ class PremiumEmojiResolver:
     def _atomic_write(cls, payload: Dict[str, Any]) -> None:
         tmp_path = cls._cache_path.with_suffix(".tmp")
         cls._cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         tmp_path.replace(cls._cache_path)
 
     @classmethod
-    def _parse_v4_entries(cls, raw_entries: Any) -> Dict[str, Dict[str, Any]]:
+    def _parse_schema_entries(cls, raw_entries: Any) -> Dict[str, Dict[str, Any]]:
         entries: Dict[str, Dict[str, Any]] = {}
         if not isinstance(raw_entries, dict):
             return entries
@@ -175,9 +262,10 @@ class PremiumEmojiResolver:
             if key not in NORMAL_SET or not isinstance(value, dict):
                 continue
             record: Dict[str, Any] = {}
-            if "premium_id" in value:
+            premium_val = value.get("premium_id")
+            if premium_val is not None:
                 try:
-                    record["premium_id"] = int(value["premium_id"])
+                    record["premium_id"] = int(premium_val)
                 except (TypeError, ValueError):
                     pass
             unicode_val = value.get("unicode")
@@ -186,6 +274,19 @@ class PremiumEmojiResolver:
             if record:
                 entries[key] = record
         return entries
+
+    @staticmethod
+    def _parse_duplicates(raw_duplicates: Any) -> Dict[str, int]:
+        if not isinstance(raw_duplicates, dict):
+            return {}
+        parsed: Dict[str, int] = {}
+        for key, count in raw_duplicates.items():
+            if key in NORMAL_SET:
+                try:
+                    parsed[key] = int(count)
+                except (TypeError, ValueError):
+                    continue
+        return parsed
 
     @classmethod
     def _migrate_legacy_entries(cls, data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -225,88 +326,104 @@ class PremiumEmojiResolver:
         return key if key in NORMAL_SET else None
 
     @classmethod
-    def _key_from_line(cls, line: str) -> Optional[str]:
+    def _split_line_for_entry(cls, line: str) -> Tuple[Optional[str], Optional[int]]:
         if not line:
-            return None
-        stripped = line.strip()
-        while stripped and stripped[0] in cls._key_prefix_chars:
-            stripped = stripped[1:].lstrip()
+            return None, None
+        length = len(line)
+        cursor = 0
+        while cursor < length and line[cursor].isspace():
+            cursor += 1
+        while cursor < length and line[cursor] in cls._key_prefix_chars:
+            cursor += 1
+        while cursor < length and line[cursor].isspace():
+            cursor += 1
         for sep in (":", "-", "—", "–", "|"):
-            if sep in stripped:
-                candidate = stripped.split(sep, 1)[0].strip()
-                key = cls._normalise_key(candidate)
-                if key:
-                    return key
-        match = cls._key_pattern.match(stripped)
-        if match:
-            return cls._normalise_key(match.group(1))
-        return None
-
-    @classmethod
-    def _extract_unicode_overrides(cls, text: str) -> Dict[str, str]:
-        overrides: Dict[str, str] = {}
-        if not text:
-            return overrides
-        for raw_line in text.splitlines():
-            key = cls._key_from_line(raw_line)
+            sep_idx = line.find(sep, cursor)
+            if sep_idx == -1:
+                continue
+            candidate = line[cursor:sep_idx].strip()
+            key = cls._normalise_key(candidate)
             if not key:
                 continue
-            stripped = raw_line.strip()
-            while stripped and stripped[0] in cls._key_prefix_chars:
-                stripped = stripped[1:].lstrip()
-            remainder = stripped
-            for sep in (":", "-", "—", "–", "|"):
-                if sep in remainder:
-                    remainder = remainder.split(sep, 1)[1].strip()
-                    break
-            else:
-                continue
-            if not remainder:
-                continue
-            token = remainder.split()[0]
-            token = token.rstrip(",.;:!?)]}\"'")
-            if token:
-                overrides[key] = token
-        return overrides
+            value_start = sep_idx + 1
+            while value_start < length and line[value_start].isspace():
+                value_start += 1
+            return key, value_start
+        stripped = line.strip()
+        match = cls._key_pattern.match(stripped)
+        if match:
+            key = cls._normalise_key(match.group(1))
+            if key:
+                return key, len(line)
+        return None, None
+
+    @staticmethod
+    def _first_token(text: str) -> Optional[str]:
+        if not text:
+            return None
+        token = text.split()[0]
+        token = token.strip(",.;:!?)]}\"'")
+        return token or None
 
     @classmethod
-    def _extract_entries_from_pinned(cls, pinned: types.Message) -> Tuple[Dict[str, int], Dict[str, str]]:
+    def _extract_entries_from_pinned(cls, pinned: types.Message) -> Tuple[Dict[str, int], Dict[str, str], Dict[str, int]]:
         text = (getattr(pinned, "raw_text", "") or "").replace("\r\n", "\n")
-        unicode_overrides = cls._extract_unicode_overrides(text)
+        premium_map: Dict[str, int] = {}
+        unicode_map: Dict[str, str] = {}
+        duplicates: Dict[str, int] = {}
+        occurrences: Dict[str, int] = {}
         if not text:
-            return {}, unicode_overrides
-
+            return premium_map, unicode_map, duplicates
         entities = getattr(pinned, "entities", []) or []
         custom_entities = [
             ent
             for ent in entities
             if isinstance(ent, types.MessageEntityCustomEmoji)
         ]
-        if not custom_entities:
-            return {}, unicode_overrides
+        sorted_entities = sorted(
+            custom_entities,
+            key=lambda e: (getattr(e, "offset", 0), getattr(e, "length", 0), getattr(e, "document_id", 0)),
+        )
 
-        new_entries: Dict[str, int] = {}
-        for ent in sorted(custom_entities, key=lambda e: (e.offset, e.length, getattr(e, "document_id", 0))):
-            line_start = text.rfind("\n", 0, ent.offset)
-            if line_start == -1:
-                line_start = 0
-            else:
-                line_start += 1
-            line_end = text.find("\n", ent.offset)
-            if line_end == -1:
-                line_end = len(text)
-            line = text[line_start:line_end]
-            key = cls._key_from_line(line)
-            if not key:
-                continue
-            doc_id = getattr(ent, "document_id", None)
-            if doc_id is None:
-                continue
-            try:
-                new_entries[key] = int(doc_id)
-            except (TypeError, ValueError):
-                continue
-        return new_entries, unicode_overrides
+        offset = 0
+        for raw_line in text.splitlines(keepends=True):
+            line = raw_line.rstrip("\r\n")
+            key, value_start = cls._split_line_for_entry(line)
+            line_length = len(line)
+            line_start_offset = offset
+            line_end_offset = line_start_offset + line_length
+
+            if key and value_start is not None and value_start <= line_length:
+                count = occurrences.get(key, 0) + 1
+                occurrences[key] = count
+                if count > 1:
+                    duplicates[key] = count
+                value_offset = line_start_offset + value_start
+                # Select the last custom emoji entity that sits within the value span for this line.
+                matching_entities = [
+                    ent
+                    for ent in sorted_entities
+                    if getattr(ent, "offset", 0) >= value_offset and getattr(ent, "offset", 0) < line_end_offset
+                ]
+                selected_entity = matching_entities[-1] if matching_entities else None
+                if selected_entity is not None:
+                    doc_id = getattr(selected_entity, "document_id", None)
+                    try:
+                        premium_map[key] = int(doc_id)
+                        unicode_map.pop(key, None)
+                        offset += len(raw_line)
+                        continue
+                    except (TypeError, ValueError):
+                        pass
+                value_text = line[value_start:].strip()
+                token = cls._first_token(value_text)
+                if token:
+                    # Respect pinned Unicode verbatim (e.g. allow KEYCAP_10 -> 0️⃣ without auto-fixing).
+                    unicode_map[key] = token
+                    premium_map.pop(key, None)
+            offset += len(raw_line)
+
+        return premium_map, unicode_map, duplicates
 
     @classmethod
     async def _validate_document_ids(cls, client, entries: Dict[str, int]) -> Dict[str, int]:
@@ -374,6 +491,11 @@ class PremiumEmojiResolver:
     async def refresh_if_needed(cls, client, *, force: bool = False) -> bool:
         cls._load_cache()
         async with cls._lock:
+            if cls.current_policy() == "code_only":
+                logger.info("emoji_refresh_skipped policy=code_only force=%s", force)
+                cls._last_refresh_success = True
+                cls._cache_stale = False
+                return False
             pinned = await cls._fetch_pinned_message(client)
             if pinned is None:
                 cls._last_refresh_success = False
@@ -392,7 +514,7 @@ class PremiumEmojiResolver:
                 return False
 
             try:
-                premium_map, unicode_map = cls._extract_entries_from_pinned(pinned)
+                premium_map, unicode_map, duplicates = cls._extract_entries_from_pinned(pinned)
                 validated_premium = await cls._validate_document_ids(client, premium_map)
                 items = cls._combine_items(validated_premium, unicode_map)
             except Exception:
@@ -405,6 +527,7 @@ class PremiumEmojiResolver:
                 "fingerprint": fingerprint,
                 "pinned_message_id": getattr(pinned, "id", None),
                 "items": items,
+                "duplicates": duplicates,
             }
             cls._cache_stale = False
             cls._last_refresh_ts = time.time()
@@ -453,10 +576,16 @@ class PremiumEmojiResolver:
     @classmethod
     def emoji_for_key(cls, key: str) -> Tuple[str, Optional[int], str]:
         """
-        Resolve the glyph/document ID for a token.
+        Resolve the glyph/document ID for a token according to the active policy.
         Returns (glyph, document_id, source).
         Source is one of: PREMIUM_ID, PINNED_UNICODE, NORMAL_SET, UNKNOWN.
         """
+        policy = cls.current_policy()
+        if policy == "code_only":
+            fallback = NORMAL_SET.get(key, "")
+            source = "NORMAL_SET" if key in NORMAL_SET else "UNKNOWN"
+            return fallback, None, source
+
         cls._load_cache()
         entries = cls._cache_data.get("items", {})
         record = entries.get(key) if isinstance(entries, dict) else None
@@ -475,7 +604,7 @@ class PremiumEmojiResolver:
                 return unicode_char, None, "PINNED_UNICODE"
 
         fallback = NORMAL_SET.get(key, "")
-        source = "NORMAL_SET" if fallback else "UNKNOWN"
+        source = "NORMAL_SET" if key in NORMAL_SET else "UNKNOWN"
         return fallback, None, source
 
     @classmethod
@@ -599,6 +728,184 @@ class PremiumEmojiResolver:
         }
 
     @classmethod
+    def selfcheck_medals(cls) -> Dict[str, Any]:
+        """
+        Acceptance self-check ensuring pinned premium/unicode medals win per-key.
+        Returns a summary for pinned_prefer and pinned_strict policies.
+        """
+        snapshot_policy = cls._policy
+        snapshot_policy_source = cls._policy_source
+        snapshot_loaded = cls._cache_loaded
+        snapshot_cache = copy.deepcopy(cls._cache_data)
+        snapshot_stale = cls._cache_stale
+        premium_doc_id = 987654321012345678
+        unicode_char = "🏅"
+        test_items = {
+            "MEDAL_1": {"premium_id": premium_doc_id},
+            "MEDAL_2": {"premium_id": premium_doc_id},
+            "MEDAL_3": {"unicode": unicode_char},
+        }
+
+        def _collect(policy: str, text: str) -> Dict[str, Any]:
+            cls._policy = policy
+            cls._policy_source = "selfcheck"
+            rendered, entities, _, metadata = cls.render_with_sources(text)
+            tokens = [
+                {
+                    "key": entry.get("key"),
+                    "source": entry.get("source"),
+                    "document_id": entry.get("document_id"),
+                    "glyph": entry.get("glyph"),
+                }
+                for entry in metadata
+                if entry.get("key") in {"MEDAL_1", "MEDAL_2", "MEDAL_3"}
+            ]
+            entity_ids = [
+                getattr(ent, "document_id", None)
+                for ent in entities
+                if isinstance(ent, types.MessageEntityCustomEmoji)
+            ]
+            return {
+                "rendered": rendered,
+                "tokens": tokens,
+                "entity_ids": entity_ids,
+            }
+
+        try:
+            cls._cache_loaded = True
+            cls._cache_stale = False
+            cls._cache_data = {
+                "schema_version": cls._SCHEMA_VERSION,
+                "updated_at": "selfcheck",
+                "fingerprint": "selfcheck",
+                "pinned_message_id": 1,
+                "items": test_items,
+                "duplicates": {},
+            }
+            two_text = "{MEDAL_1} First\n{MEDAL_2} Second"
+            three_text = two_text + "\n{MEDAL_3} Third"
+            results: Dict[str, Any] = {}
+            for policy in ("pinned_prefer", "pinned_strict"):
+                two = _collect(policy, two_text)
+                three = _collect(policy, three_text)
+                results[policy] = {
+                    "two_entries": two,
+                    "three_entries": three,
+                }
+            return results
+        finally:
+            cls._policy = snapshot_policy
+            cls._policy_source = snapshot_policy_source
+            cls._cache_loaded = snapshot_loaded
+            cls._cache_stale = snapshot_stale
+            cls._cache_data = snapshot_cache
+
+    @classmethod
+    def duplicate_keys(cls) -> Dict[str, int]:
+        cls._load_cache()
+        raw = cls._cache_data.get("duplicates")
+        if isinstance(raw, dict):
+            result: Dict[str, int] = {}
+            for k, v in raw.items():
+                if k not in NORMAL_SET:
+                    continue
+                try:
+                    result[k] = int(v)
+                except (TypeError, ValueError):
+                    continue
+            return result
+        return {}
+
+    @classmethod
+    def known_keys(cls) -> List[str]:
+        cls._load_cache()
+        keys = set(NORMAL_SET.keys())
+        items = cls._cache_data.get("items", {})
+        if isinstance(items, dict):
+            keys.update(items.keys())
+        return sorted(keys)
+
+    @classmethod
+    def pinned_items(cls) -> Dict[str, Dict[str, Any]]:
+        cls._load_cache()
+        items = cls._cache_data.get("items", {})
+        if isinstance(items, dict):
+            return dict(items)
+        return {}
+
+    @classmethod
+    def keys_missing_from_pinned(cls) -> List[str]:
+        items = cls.pinned_items()
+        missing: List[str] = []
+        for key in NORMAL_SET.keys():
+            record = items.get(key)
+            if not isinstance(record, dict):
+                missing.append(key)
+                continue
+            premium_val = record.get("premium_id")
+            unicode_val = record.get("unicode")
+            has_premium = False
+            if premium_val is not None:
+                try:
+                    has_premium = int(premium_val) != 0
+                except (TypeError, ValueError):
+                    has_premium = False
+            has_unicode = isinstance(unicode_val, str) and bool(unicode_val)
+            if not has_premium and not has_unicode:
+                missing.append(key)
+        return sorted(missing)
+
+    @classmethod
+    def export_template(cls) -> Tuple[str, List[types.TypeMessageEntity]]:
+        items = cls.pinned_items()
+        keys = cls.known_keys()
+        lines: List[str] = []
+        entities: List[types.TypeMessageEntity] = []
+        offset = 0
+        total = len(keys)
+        for idx, key in enumerate(keys):
+            record = items.get(key, {})
+            premium_id: Optional[int] = None
+            unicode_val: Optional[str] = None
+            if isinstance(record, dict):
+                premium_val = record.get("premium_id")
+                if premium_val is not None:
+                    try:
+                        premium_id = int(premium_val)
+                    except (TypeError, ValueError):
+                        premium_id = None
+                unicode_candidate = record.get("unicode")
+                if isinstance(unicode_candidate, str) and unicode_candidate:
+                    unicode_val = unicode_candidate
+            glyph: str
+            if premium_id:
+                glyph = cls._placeholder
+            else:
+                fallback = NORMAL_SET.get(key)
+                if unicode_val is not None:
+                    glyph = unicode_val
+                elif fallback is not None:
+                    glyph = fallback
+                else:
+                    glyph = "?"
+            line = f"{key}: {glyph}"
+            lines.append(line)
+            if premium_id:
+                entities.append(
+                    types.MessageEntityCustomEmoji(
+                        offset=offset + len(f"{key}: "),
+                        length=len(glyph) or 1,
+                        document_id=premium_id,
+                    )
+                )
+            offset += len(line)
+            if idx != total - 1:
+                lines.append("\n")
+                offset += 1
+        text = "".join(lines)
+        return text, entities
+
+    @classmethod
     def missing_keys(cls) -> List[str]:
         return cls.resolution_breakdown().get("FALLING_BACK", [])
 
@@ -622,6 +929,13 @@ class PremiumEmojiResolver:
     @classmethod
     def last_refresh_success(cls) -> bool:
         return cls._last_refresh_success
+
+
+PremiumEmojiResolver._apply_env_policy()
+
+
+def selfcheck_medals() -> Dict[str, Any]:
+    return PremiumEmojiResolver.selfcheck_medals()
 
 
 def _self_check_mixed_render() -> None:
@@ -662,4 +976,9 @@ async def has_premium(client) -> bool:
     Check whether the current sender account has Telegram Premium.
     """
     me = await client.get_me()
-    return bool(getattr(me, "premium", False))
+    premium = bool(getattr(me, "premium", False))
+    try:
+        PremiumEmojiResolver.register_premium_status(premium)
+    except Exception:
+        logger.exception("Failed to register premium status update")
+    return premium
