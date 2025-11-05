@@ -1350,6 +1350,23 @@ async def _handle_admin_command(event):
     if not text.startswith('.'):
         return
     lowered = text.lower()
+    if lowered.startswith('.audit'):
+        parts = text.split()
+        if len(parts) != 2 or parts[1].lower() not in {'quick', 'full'}:
+            await event.respond('Usage: .audit quick|full')
+            return
+        run_quick = parts[1].lower() == 'quick'
+        try:
+            from tools import audit_runner
+
+            runner = audit_runner.AuditRunner(sys.modules[__name__])
+            report = await runner.run(quick=run_quick)
+            summary = report.format_summary()
+            for chunk in audit_runner.split_for_telegram(summary):
+                await event.respond(chunk)
+        except Exception as exc:
+            await event.respond(f'Audit failed: {exc}')
+        return
     if lowered.startswith('.emoji'):
         parts = text.split()
         if len(parts) == 1:
