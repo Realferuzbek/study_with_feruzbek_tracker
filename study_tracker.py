@@ -13,6 +13,36 @@ from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
+# ---- Local environment loader ----
+def _load_local_env() -> None:
+    """
+    Populate os.environ from .env.local without overruling existing variables.
+    Allows scheduler launches (which run without a shell) to see overrides like EMOJI_POLICY.
+    """
+    env_path = Path(__file__).with_name(".env.local")
+    try:
+        data = env_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+    for raw_line in data.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key.startswith("#"):
+            continue
+        value = value.strip()
+        if value and ((value[0] == value[-1]) and value[0] in ("'", '"')):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+_load_local_env()
+
 # ---- Timezone (Asia/Tashkent) with fallback ----
 try:
     from zoneinfo import ZoneInfo
@@ -643,17 +673,26 @@ def choose_daily(user_id: int, day_dt: datetime, avoid: set[str]) -> str:
 
 # ---------- Ranking/formatting ----------
 def _rank_medal(i: int) -> str:
-    return "🥇" if i == 1 else ("🥈" if i == 2 else ("🥉" if i == 3 else ""))
+    if i == 1: return "{MEDAL_1}"
+    if i == 2: return "{MEDAL_2}"
+    if i == 3: return "{MEDAL_3}"
+    return ""
 
-_KEYCAPS = {"1":"1️⃣","2":"2️⃣","3":"3️⃣","4":"4️⃣","5":"5️⃣","6":"6️⃣","7":"7️⃣","8":"8️⃣","9":"9️⃣","10":"🔟"}
-def _rank_keycap(n: int) -> str: return _KEYCAPS.get(str(n), str(n)) if 1 <= n <= 10 else str(n)
+_KEYCAPS = {
+    1: "{KEYCAP_1}", 2: "{KEYCAP_2}", 3: "{KEYCAP_3}", 4: "{KEYCAP_4}", 5: "{KEYCAP_5}",
+    6: "{KEYCAP_6}", 7: "{KEYCAP_7}", 8: "{KEYCAP_8}", 9: "{KEYCAP_9}", 10: "{KEYCAP_10}",
+}
+def _rank_keycap(n: int) -> str:
+    if 1 <= n <= 10:
+        return _KEYCAPS.get(n, str(n))
+    return str(n)
 
 def _badge_for_minutes(mins: int) -> str:
-    if mins >= 180: return "🚀"
-    if mins >= 120: return "🔥"
-    if mins >=  60: return "💪"
-    if mins >=   1: return "✅"
-    return "😴"
+    if mins >= 180: return "{ROCKET}"
+    if mins >= 120: return "{FIRE}"
+    if mins >=  60: return "{FLEXED_BICEPS}"
+    if mins >=   1: return "{CHECK_MARK}"
+    return "{SLEEPING_FACE}"
 
 def _mins(secs: int) -> int: return max(0, secs // 60)
 
@@ -678,7 +717,7 @@ def _emoji_to_end(s: str) -> str:
 
 def _title_with_day(anchor: datetime, today: datetime) -> str:
     day_idx = _day_index(anchor, today)
-    return _b(f"📊 LEADERBOARD{EM_DASH}DAY {day_idx} 👑")
+    return _b(f"{{BAR_CHART}} LEADERBOARD{EM_DASH}DAY {day_idx} {{CROWN}}")
 
 def _header_block(label: str, header_right: str) -> str:
     safe_label = html.escape(label)
@@ -702,6 +741,7 @@ def _section_entries(
             comp = compliments_by_user.get(uid)
             if comp:
                 compliment = _emoji_to_end(comp)
+                compliment = _replace_emojis_with_tokens(compliment)
         entries.append(
             {
                 "rank": idx,
@@ -719,7 +759,7 @@ def _section_entries(
 
 def _render_section(label: str, header_right: str, entries: list[dict[str, object]]) -> str:
     if not entries:
-        return f"{_header_block(label, header_right)}\n{_b('nobody did lessons 😴')}"
+        return f"{_header_block(label, header_right)}\n{_b('nobody did lessons {SLEEPING_FACE}')}"
     lines = [_header_block(label, header_right)]
     for entry in entries:
         display = html.escape(str(entry["display"]))
@@ -759,6 +799,26 @@ _NORMAL_EMOJI_SORTED = sorted(
     key=lambda kv: len(kv[1]),
     reverse=True,
 )
+
+def _replace_emojis_with_tokens(text: str) -> str:
+    if not text:
+        return text
+    parts: list[str] = []
+    i = 0
+    while i < len(text):
+        matched: Optional[tuple[str, str]] = None
+        for key, emoji in _NORMAL_EMOJI_SORTED:
+            if text.startswith(emoji, i):
+                matched = (key, emoji)
+                break
+        if matched:
+            key, emoji = matched
+            parts.append(f"{{{key}}}")
+            i += len(emoji)
+        else:
+            parts.append(text[i])
+            i += 1
+    return "".join(parts)
 _PREMIUM_LOGGED = False
 _LAYOUT_LOGGED = False
 
@@ -1027,9 +1087,9 @@ async def _build_leaderboard_context(
     week_entries = _section_entries(week_rows, week_comps, canon_label)
     month_entries = _section_entries(month_rows, month_comps, canon_label)
 
-    today_label = "📅 Today"
-    week_label = f"📆 This{NBSP}Week"
-    month_label = f"🗓️ This{NBSP}Month"
+    today_label = "{CALENDAR} Today"
+    week_label = f"{{TEAR_OFF_CALENDAR}} This{NBSP}Week"
+    month_label = f"{{SPIRAL_CALENDAR}} This{NBSP}Month"
     today_txt = _render_section(today_label, today_hdr, day_entries)
     week_txt = _render_section(week_label, week_hdr, week_entries)
     month_txt = _render_section(month_label, month_hdr, month_entries)
@@ -1038,7 +1098,7 @@ async def _build_leaderboard_context(
     motd_lines: List[str] = []
     if q:
         motd_lines = [
-            _b(f"WORD OF THE DAY {WOTD_MARK}"),
+            _b("WORD OF THE DAY {WOTD_MARK}"),
             f"{QUOTE_L}{html.escape(q)}{QUOTE_R}",
         ]
     motd = "\n".join(motd_lines) if motd_lines else ""
@@ -1137,14 +1197,31 @@ async def post_leaderboard(
     counts = PremiumEmojiResolver.counts()
     missing = breakdown.get('FALLING_BACK', [])
     fingerprint = PremiumEmojiResolver.current_fingerprint() or "none"
+    premium_count = counts.get('mapped_premium', 0)
+    unicode_count = counts.get('pinned_unicode', 0)
+    fallback_count = counts.get('normal_fallback', 0)
+    if premium_count:
+        emoji_origin = "saved_messages_premium"
+    elif unicode_count:
+        emoji_origin = "saved_messages_unicode"
+    else:
+        emoji_origin = "code_defaults"
     logger.info(
         'post_sent emoji_mode=%s mapped_premium=%d pinned_unicode=%d normal_fallback=%d missing_keys=%s fingerprint=%s',
         PremiumEmojiResolver.current_policy(),
-        counts.get('mapped_premium', 0),
-        counts.get('pinned_unicode', 0),
-        counts.get('normal_fallback', 0),
+        premium_count,
+        unicode_count,
+        fallback_count,
         missing,
         fingerprint,
+    )
+    logger.info(
+        'emoji_usage origin=%s resolution_mode=%s premium_keys=%d pinned_unicode_keys=%d fallback_keys=%d',
+        emoji_origin,
+        PremiumEmojiResolver.resolution_mode(),
+        premium_count,
+        unicode_count,
+        fallback_count,
     )
 
     try:
@@ -1196,9 +1273,9 @@ def _audit_layout_text(text: str) -> tuple[bool, str]:
     if len(lines) < 2 or not re.fullmatch(rf"📊 LEADERBOARD{dash_pattern}DAY \d+ 👑", lines[1]):
         return False, f"line 2 mismatch (expected 📊 LEADERBOARD{EM_DASH}DAY N 👑)"
     header_checks = [
-        (f"{QUOTE_L}📅 Today{EM_DASH}", "missing Today header"),
-        (f"{QUOTE_L}📆 This{NBSP}Week{EM_DASH}", "missing This Week header"),
-        (f"{QUOTE_L}🗓️ This{NBSP}Month{EM_DASH}", "missing This Month header"),
+        (f"{QUOTE_L}{{CALENDAR}} Today{EM_DASH}", "missing Today header"),
+        (f"{QUOTE_L}{{TEAR_OFF_CALENDAR}} This{NBSP}Week{EM_DASH}", "missing This Week header"),
+        (f"{QUOTE_L}{{SPIRAL_CALENDAR}} This{NBSP}Month{EM_DASH}", "missing This Month header"),
     ]
     for prefix, message in header_checks:
         match_line = next((ln for ln in lines if ln.startswith(prefix)), None)
@@ -1212,7 +1289,7 @@ def _audit_layout_text(text: str) -> tuple[bool, str]:
         return False, "found en dash"
     if "\u2212" in stripped:
         return False, "found minus sign"
-    motd_header = f"WORD OF THE DAY {WOTD_MARK}"
+    motd_header = "WORD OF THE DAY {WOTD_MARK}"
     if motd_header in lines:
         idx = lines.index(motd_header)
         if idx + 1 >= len(lines) or not (lines[idx + 1].startswith(QUOTE_L) and lines[idx + 1].endswith(QUOTE_R)):
@@ -1834,6 +1911,12 @@ async def main():
     else:
         status = 'updated' if hydrate_status else 'unchanged'
         logger.info('emoji hydrate startup status=%s fingerprint=%s', status, PremiumEmojiResolver.fingerprint_short())
+    logger.info(
+        "emoji policy startup policy=%s source=%s env=%s",
+        PremiumEmojiResolver.current_policy(),
+        PremiumEmojiResolver.policy_source(),
+        os.environ.get("EMOJI_POLICY"),
+    )
     _log_emoji_counts('emoji_counts_startup')
     asyncio.create_task(_periodic_emoji_refresh())
     asyncio.create_task(_periodic_emoji_report())
