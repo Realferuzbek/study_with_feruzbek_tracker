@@ -134,7 +134,7 @@ SNAPSHOT_POLL_EVERY  = 30
 FLUSH_EVERY  = 600  # 10 minutes
 
 # Daily post time (Asia/Tashkent)
-POST_HOUR    = 21
+POST_HOUR    = 22
 POST_MINUTE  = 0
 
 DB_PATH      = "study.db"
