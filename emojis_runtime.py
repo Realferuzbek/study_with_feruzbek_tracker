@@ -27,7 +27,7 @@ NORMAL_SET: Dict[str, str] = {
     "BRAIN": "🧠",
     "BRICK": "🧱",
     "BURST": "💥",
-    "BULLET": "• ",
+    "BULLET": "",
     "CALENDAR": "📅",
     "CASTLE": "🏰",
     "CHAINS": "⛓️",
