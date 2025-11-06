@@ -941,7 +941,7 @@ async def _build_leaderboard_context(
     if q:
         motd_lines = [
             _b(f"WORD OF THE DAY {WOTD_MARK}"),
-            f"<blockquote>{_i(q)}</blockquote>",
+            f"<blockquote><b><i>{html.escape(q)}</i></b></blockquote>",
         ]
     motd = "\n".join(motd_lines) if motd_lines else ""
 
