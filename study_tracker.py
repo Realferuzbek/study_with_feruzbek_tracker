@@ -8,16 +8,16 @@
 # - Daily auto post at 22:00 Asia/Tashkent
 # - Manual "post now" without breaking daily schedule (post_now.flag)
 
-import asyncio, time, re, sqlite3, os, sys, traceback, random, html, json, copy
+import asyncio, time, re, sqlite3, os, sys, traceback, random, html, json
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
-from typing import Any, Dict, List, Match, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 # ---- Local environment loader ----
 def _load_local_env() -> None:
     """
     Populate os.environ from .env.local without overruling existing variables.
-    Allows scheduler launches (which run without a shell) to see overrides like EMOJI_POLICY.
+    Allows scheduler launches (which run without a shell) to see local overrides.
     """
     env_path = Path(__file__).with_name(".env.local")
     try:
@@ -51,20 +51,18 @@ except Exception:
     TZ = timezone(timedelta(hours=5))  # UTC+5 fallback
 
 from telethon import TelegramClient, functions, types, events
-from telethon.errors import RPCError, FloodWaitError
+from telethon.errors import FloodWaitError
 from telethon.extensions import html as tele_html
 from telethon.utils import get_peer_id
 
-from emojis_runtime import NORMAL_SET, PremiumEmojiResolver, has_premium
+from emojis_runtime import NORMAL_SET
 
 NBSP = "\u00A0"
 QUOTE_L = NORMAL_SET["QUOTE_L"]
 QUOTE_R = NORMAL_SET["QUOTE_R"]
 EM_DASH = NORMAL_SET["EM_DASH"]
 RANGE_SEP = NORMAL_SET["RANGE_SEP"]
-BULLET = NORMAL_SET["BULLET"]
 WOTD_MARK = NORMAL_SET["WOTD_MARK"]
-_TOKEN_PLACEHOLDER_RE = re.compile(r"\{([A-Z0-9_]+)\}")
 
 # ---- Windows single-instance guard (coexists with PS1 mutex) ----
 import ctypes, ctypes.wintypes
@@ -160,9 +158,6 @@ SESSION_MIN_SECONDS = 300
 # Daily minimum for inclusion is now disabled (session gate handles fairness)
 MIN_DAILY_SECONDS = 0
 
-HYDRATE_INTERVAL_MIN = max(int(os.getenv("HYDRATE_INTERVAL_MIN", "10")), 1)
-HYDRATE_INTERVAL_SEC = HYDRATE_INTERVAL_MIN * 60
-EMOJI_STATUS_INTERVAL_SEC = 24 * 60 * 60
 _ADMIN_CHAT_ENV = os.getenv("ADMIN_CHAT_ID")
 if _ADMIN_CHAT_ENV:
     try:
@@ -712,9 +707,16 @@ def _title_with_day(anchor: datetime, today: datetime) -> str:
     return _b(f"📊 LEADERBOARD{EM_DASH}DAY {day_idx} 👑")
 
 def _header_block(label: str, header_right: str) -> str:
-    safe_label = html.escape(label)
-    safe_right = html.escape(header_right)
-    return f"<blockquote>{QUOTE_L}{safe_label}{EM_DASH}{safe_right}{QUOTE_R}</blockquote>"
+    combined = f"{label}{EM_DASH}{header_right}"
+    return f"<blockquote>{_b(combined)}</blockquote>"
+
+
+def render_period(label: str, rows: list[str] | None, header_right: str = "") -> str:
+    block = _header_block(label, header_right)
+    if not rows:
+        return f"{block}\n{_b('nobody did lessons 😴')}"
+    return block + "\n" + "\n".join(rows)
+
 
 def _section_entries(
     rows,
@@ -749,213 +751,26 @@ def _section_entries(
 
 
 def _render_section(label: str, header_right: str, entries: list[dict[str, object]]) -> str:
-    if not entries:
-        return f"{_header_block(label, header_right)}\n{_b('nobody did lessons 😴')}"
-    lines = [_header_block(label, header_right)]
+    lines: list[str] = []
     for entry in entries:
-        display = html.escape(str(entry["display"]))
-        line = f"{{BULLET}}{entry['rank_emoji']} {display}{EM_DASH}{entry['minutes']}m {entry['badge']}"
+        display = _b(str(entry["display"]))
+        prefix = entry["rank_emoji"]
+        spacer = " " if prefix else ""
+        line = f"{prefix}{spacer}{display}{EM_DASH}{entry['minutes']}m {entry['badge']}"
         compliment = str(entry.get("compliment", "") or "").strip()
         if compliment:
-            line = f"{line}{EM_DASH}{html.escape(compliment)}"
+            line = f"{line}{EM_DASH}{_b(compliment)}"
         lines.append(line)
-    return "\n".join(lines)
+    return render_period(label, lines, header_right)
 
-# ---------- Premium emoji helpers ----------
-class _TokenMatch(NamedTuple):
-    key: str
-    original_start: int
-    original_len: int
-    token_start: int
-    token_len: int
-
-
-class PremiumSendResult(NamedTuple):
-    message: types.Message
-    metadata: List[Dict[str, Any]]
+# ---------- Layout preview helpers ----------
+_LAYOUT_LOGGED = False
 
 
 class LayoutPreview(NamedTuple):
     html_text: str
     plain_text: str
     rendered_text: str
-
-
-class PreviewResult(NamedTuple):
-    message_text: str
-    html_text: str
-    explain_table: str
-    per_key_sources: Dict[str, str]
-    breakdown: Dict[str, List[str]]
-    mode: str
-
-
-_NORMAL_EMOJI_SORTED = sorted(
-    (item for item in NORMAL_SET.items() if item[1]),
-    key=lambda kv: len(kv[1]),
-    reverse=True,
-)
-_PREMIUM_LOGGED = False
-_LAYOUT_LOGGED = False
-
-
-def _tokenize_plain_text(text: str) -> tuple[str, List[_TokenMatch]]:
-    tokens: List[_TokenMatch] = []
-    parts: List[str] = []
-    i = 0
-    new_len = 0
-    while i < len(text):
-        if text[i] == "{":
-            closing = text.find("}", i + 1)
-            if closing != -1:
-                candidate = text[i + 1 : closing]
-                if candidate in NORMAL_SET:
-                    token = text[i : closing + 1]
-                    token_len = len(token)
-                    tokens.append(_TokenMatch(candidate, i, token_len, new_len, token_len))
-                    parts.append(token)
-                    new_len += token_len
-                    i = closing + 1
-                    continue
-        matched: Optional[tuple[str, str]] = None
-        for key, emoji in _NORMAL_EMOJI_SORTED:
-            if text.startswith(emoji, i):
-                matched = (key, emoji)
-                break
-        if matched:
-            key, emoji = matched
-            token = f"{{{key}}}"
-            tokens.append(_TokenMatch(key, i, len(emoji), new_len, len(token)))
-            parts.append(token)
-            new_len += len(token)
-            i += len(emoji)
-        else:
-            ch = text[i]
-            parts.append(ch)
-            new_len += 1
-            i += 1
-    return "".join(parts), tokens
-
-
-def _token_metadata_for_logging(html_text: str, *, prefer_fallback: bool = False) -> List[Dict[str, Any]]:
-    plain_text, _ = tele_html.parse(html_text)
-    tokenized_text, tokens = _tokenize_plain_text(plain_text)
-    if not tokens:
-        return []
-    _, _, _, metadata = PremiumEmojiResolver.render_with_sources(tokenized_text)
-    if prefer_fallback:
-        for item in metadata:
-            if item.get("document_id") is not None:
-                item["document_id"] = None
-                source = item.get("source", "")
-                item["source"] = f"FALLBACK_{source}" if source else "FALLBACK"
-    return metadata
-
-
-def _render_html_with_token_fallbacks(html_text: str) -> str:
-    """
-    Replace {TOKEN} placeholders with non-premium glyphs so fallback HTML posts render cleanly.
-    """
-
-    def _replacement(match: Match[str]) -> str:
-        key = match.group(1)
-        glyph, document_id, _ = PremiumEmojiResolver.emoji_for_key(key)
-        if document_id is not None:
-            return NORMAL_SET.get(key, glyph or "")
-        return glyph or NORMAL_SET.get(key, "")
-
-    return _TOKEN_PLACEHOLDER_RE.sub(_replacement, html_text)
-
-
-def _offset_stage0_to_stage1(tokens: List[_TokenMatch], offset: int) -> Optional[int]:
-    delta = 0
-    for tok in tokens:
-        tok_end = tok.original_start + tok.original_len
-        if offset >= tok_end:
-            delta += tok.token_len - tok.original_len
-            continue
-        if tok.original_start < offset < tok_end:
-            return None
-        break
-    return offset + delta
-
-
-def _offset_stage1_to_stage2(
-    tokens: List[_TokenMatch],
-    offset: int,
-    final_lengths: List[int],
-) -> Optional[int]:
-    delta = 0
-    for idx, tok in enumerate(tokens):
-        tok_end = tok.token_start + tok.token_len
-        if offset >= tok_end:
-            replacement_len = final_lengths[idx] if idx < len(final_lengths) else 0
-            delta += replacement_len - tok.token_len
-            continue
-        if tok.token_start < offset < tok_end:
-            return None
-        break
-    return offset + delta
-
-
-def _retarget_markup_entities(
-    entities: List[types.TypeMessageEntity],
-    tokens: List[_TokenMatch],
-    final_lengths: List[int],
-) -> Optional[List[types.TypeMessageEntity]]:
-    adjusted: List[types.TypeMessageEntity] = []
-    for ent in entities:
-        start = ent.offset
-        end = ent.offset + ent.length
-        stage1_start = _offset_stage0_to_stage1(tokens, start)
-        stage1_end = _offset_stage0_to_stage1(tokens, end)
-        if stage1_start is None or stage1_end is None:
-            return None
-        final_start = _offset_stage1_to_stage2(tokens, stage1_start, final_lengths)
-        final_end = _offset_stage1_to_stage2(tokens, stage1_end, final_lengths)
-        if (
-            final_start is None
-            or final_end is None
-            or final_end < final_start
-        ):
-            return None
-        ent_copy = copy.deepcopy(ent)
-        ent_copy.offset = final_start
-        ent_copy.length = final_end - final_start
-        adjusted.append(ent_copy)
-    return adjusted
-
-
-async def _try_send_premium(client, target, html_text: str) -> Optional[PremiumSendResult]:
-    global _PREMIUM_LOGGED
-
-    plain_text, markup_entities = tele_html.parse(html_text)
-    tokenized_text, tokens = _tokenize_plain_text(plain_text)
-    if not tokens:
-        return None
-
-    await PremiumEmojiResolver.refresh_if_needed(client)
-    if not PremiumEmojiResolver.last_refresh_success():
-        logger.warning('emoji hydrate failed before posting; using cached data')
-
-    rendered_text, emoji_entities, final_lengths, metadata = PremiumEmojiResolver.render_with_sources(tokenized_text)
-    markup_shifted = _retarget_markup_entities(markup_entities, tokens, final_lengths)
-    if markup_shifted is None:
-        raise ValueError("Failed to remap markup entities for premium emojis.")
-
-    formatting_entities = markup_shifted + emoji_entities
-    formatting_entities.sort(key=lambda ent: ent.offset)
-
-    message = await _send_message_with_retry(
-        target,
-        rendered_text,
-        formatting_entities=formatting_entities,
-    )
-
-    if not _PREMIUM_LOGGED:
-        logger.info("premium_emojis=on")
-        _PREMIUM_LOGGED = True
-    return PremiumSendResult(message=message, metadata=metadata)
 
 # ---------- GROUP CHANGE AUTO-RESET ----------
 def _reset_all_state_for_new_group(new_group_key: str):
@@ -1029,6 +844,11 @@ async def _build_leaderboard_context(
     anchor = _ensure_anchor()
 
     alias_to_canon, canon_label = _alias_maps_from_cache()
+    canon_to_alias: dict[int, set[int]] = {}
+    for alias_id, canon_id in alias_to_canon.items():
+        canon_to_alias.setdefault(canon_id, set()).add(alias_id)
+    for canon_id in list(canon_to_alias.keys()):
+        canon_to_alias[canon_id].add(canon_id)
 
     week_idx, w_start, w_end = _week_block(anchor, now)
     month_idx, m_start, m_end = _month30_block(anchor, now)
@@ -1052,22 +872,38 @@ async def _build_leaderboard_context(
         week_map  = {uid: secs for uid, secs in week_rows}
         month_map = {uid: secs for uid, secs in month_rows}
 
+        extra_by_canon: dict[int, int] = {}
+        stored_cache: dict[int, int] = {}
+
         for raw_uid, join_ts in list(live_seen_snapshot.items()):
-            uid = alias_to_canon.get(raw_uid, raw_uid)
+            canon_uid = alias_to_canon.get(raw_uid, raw_uid)
             active_delta = int(max(0, now_ts - join_ts))
-            total_session_so_far = int(sess_acc.get(uid, 0)) + int(sess_acc.get(raw_uid, 0))
-            qualified_now = bool(sess_ok.get(uid, False) or (total_session_so_far + active_delta) >= SESSION_MIN_SECONDS)
-            if not qualified_now:
+            if active_delta <= 0:
                 continue
 
-            stored_today = db_get_day_seconds(uid, today_str)
-            extra_for_today = active_delta
+            related_ids = canon_to_alias.get(canon_uid, {canon_uid})
+            max_session = max((int(sess_acc.get(rid, 0)) for rid in related_ids), default=0)
+            qualified_now = any(sess_ok.get(rid, False) for rid in related_ids)
+            if not qualified_now and (max_session + active_delta) < SESSION_MIN_SECONDS:
+                continue
+
+            prev_extra = extra_by_canon.get(canon_uid, 0)
+            if active_delta > prev_extra:
+                extra_by_canon[canon_uid] = active_delta
+
+        for canon_uid, extra_for_today in extra_by_canon.items():
             if extra_for_today <= 0:
                 continue
-
-            day_map[uid]   = max(day_map.get(uid, 0), stored_today) + extra_for_today
-            week_map[uid]  = week_map.get(uid, 0)  + extra_for_today
-            month_map[uid] = month_map.get(uid, 0) + extra_for_today
+            if canon_uid not in stored_cache:
+                ids_for_lookup = set(canon_to_alias.get(canon_uid, {canon_uid}))
+                ids_for_lookup.add(canon_uid)
+                stored_cache[canon_uid] = max((db_get_day_seconds(rid, today_str) for rid in ids_for_lookup), default=0)
+            stored_today = stored_cache[canon_uid]
+            current_today = day_map.get(canon_uid, 0)
+            base_today = max(current_today, stored_today)
+            day_map[canon_uid] = base_today + extra_for_today
+            week_map[canon_uid] = week_map.get(canon_uid, 0) + extra_for_today
+            month_map[canon_uid] = month_map.get(canon_uid, 0) + extra_for_today
 
         day_rows   = _unique_sorted(list(day_map.items()))
         week_rows  = _unique_sorted(list(week_map.items()))
@@ -1105,11 +941,11 @@ async def _build_leaderboard_context(
     if q:
         motd_lines = [
             _b(f"WORD OF THE DAY {WOTD_MARK}"),
-            f"{QUOTE_L}{html.escape(q)}{QUOTE_R}",
+            _b(f"{QUOTE_L}{q}{QUOTE_R}"),
         ]
     motd = "\n".join(motd_lines) if motd_lines else ""
 
-    header_block = f"Study With Me\n{title}"
+    header_block = title
     sections = [today_txt, week_txt, month_txt]
     if motd:
         sections.append(motd)
@@ -1158,7 +994,6 @@ async def post_leaderboard(
         session_qualified=session_qualified,
         override_now=override_now,
     )
-    await PremiumEmojiResolver.refresh_if_needed(client)
 
     msg = context["msg"]
     now = context["now"]
@@ -1175,76 +1010,11 @@ async def post_leaderboard(
     m_start = context["m_start"]
     m_end = context["m_end"]
 
-    premium_result: PremiumSendResult | None = None
-    try:
-        premium_capable = await has_premium(client)
-    except Exception:
-        premium_capable = False
-
-    # NEW: auto-enable pinned emoji mapping for premium accounts
-    PremiumEmojiResolver.set_policy("pinned_prefer" if premium_capable else "code_only")
-
-    if premium_capable:
-        try:
-            premium_result = await _try_send_premium(client, ent, msg)
-        except RPCError:
-            premium_result = None
-            logger.warning("premium_failed_fallback")
-        except Exception:
-            premium_result = None
-            logger.warning("premium_failed_fallback")
-
-    token_metadata: List[Dict[str, Any]] = []
-    if premium_result is not None:
-        sent_message = premium_result.message
-        token_metadata = premium_result.metadata
-    else:
-        token_metadata = _token_metadata_for_logging(msg, prefer_fallback=True)
-        fallback_html = _render_html_with_token_fallbacks(msg)
-        sent_message = await _send_message_with_retry(ent, fallback_html, parse_mode="html")
+    sent_message = await _send_message_with_retry(ent, msg, parse_mode="html")
+    logger.info("leaderboard_sent mode=unicode")
     if mark_daily:
         db_set_meta("last_post_date", now.date().isoformat())
     print(f"Posted leaderboard for {now.date().isoformat()} (mark_daily={mark_daily}).")
-
-    breakdown = PremiumEmojiResolver.resolution_breakdown()
-    counts = PremiumEmojiResolver.counts()
-    missing = breakdown.get('FALLING_BACK', [])
-    fingerprint = PremiumEmojiResolver.current_fingerprint() or "none"
-    premium_count = counts.get('mapped_premium', 0)
-    unicode_count = counts.get('pinned_unicode', 0)
-    fallback_count = counts.get('normal_fallback', 0)
-    if premium_count:
-        emoji_origin = "saved_messages_premium"
-    elif unicode_count:
-        emoji_origin = "saved_messages_unicode"
-    else:
-        emoji_origin = "code_defaults"
-    premium_keys_used = sorted({entry.get('key') for entry in token_metadata if entry.get('source') == 'PREMIUM_ID' and entry.get('key')})
-    unicode_keys_used = sorted({entry.get('key') for entry in token_metadata if entry.get('source') == 'PINNED_UNICODE' and entry.get('key')})
-    fallback_keys_used = sorted({
-        entry.get('key') for entry in token_metadata
-        if entry.get('source') not in ('PREMIUM_ID', 'PINNED_UNICODE') and entry.get('key')
-    })
-    logger.info(
-        'post_sent emoji_mode=%s mapped_premium=%d pinned_unicode=%d normal_fallback=%d missing_keys=%s fingerprint=%s',
-        PremiumEmojiResolver.current_policy(),
-        premium_count,
-        unicode_count,
-        fallback_count,
-        missing,
-        fingerprint,
-    )
-    logger.info(
-        'emoji_usage origin=%s resolution_mode=%s premium_keys=%d pinned_unicode_keys=%d fallback_keys=%d premium_list=%s pinned_unicode_list=%s fallback_list=%s',
-        emoji_origin,
-        PremiumEmojiResolver.resolution_mode(),
-        premium_count,
-        unicode_count,
-        fallback_count,
-        premium_keys_used,
-        unicode_keys_used,
-        fallback_keys_used,
-    )
 
     try:
         chat_id = int(get_peer_id(ent))
@@ -1295,13 +1065,13 @@ def _audit_layout_text(text: str) -> tuple[bool, str]:
     if len(lines) < 2 or not re.fullmatch(rf"📊 LEADERBOARD{dash_pattern}DAY \d+ 👑", lines[1]):
         return False, f"line 2 mismatch (expected 📊 LEADERBOARD{EM_DASH}DAY N 👑)"
     header_checks = [
-        (f"{QUOTE_L}📅 Today{EM_DASH}", "missing Today header"),
-        (f"{QUOTE_L}📆 This{NBSP}Week{EM_DASH}", "missing This Week header"),
-        (f"{QUOTE_L}🗓️ This{NBSP}Month{EM_DASH}", "missing This Month header"),
+        (f"📅 Today{EM_DASH}", "missing Today header"),
+        (f"📆 This{NBSP}Week{EM_DASH}", "missing This Week header"),
+        (f"🗓️ This{NBSP}Month{EM_DASH}", "missing This Month header"),
     ]
     for prefix, message in header_checks:
         match_line = next((ln for ln in lines if ln.startswith(prefix)), None)
-        if not match_line or not match_line.endswith(QUOTE_R):
+        if not match_line:
             return False, message
     if "This Week" in stripped or "This Month" in stripped:
         return False, "non-breaking space missing in section label"
@@ -1346,93 +1116,11 @@ async def render_preview_layout(
     plain_text, _ = tele_html.parse(html_text)
     if not plain_text.endswith("\n"):
         plain_text = f"{plain_text}\n"
-    tokenized_text, _ = _tokenize_plain_text(plain_text)
-    await PremiumEmojiResolver.refresh_if_needed(client)
-    rendered_text, _, _, _ = PremiumEmojiResolver.render_with_sources(tokenized_text)
     return LayoutPreview(
         html_text=html_text,
         plain_text=plain_text,
-        rendered_text=rendered_text,
+        rendered_text=plain_text,
     )
-
-async def render_preview(
-    live_seen_snapshot: dict[int, float] | None = None,
-    session_accum_secs: dict[int, int] | None = None,
-    session_qualified: dict[int, bool] | None = None,
-    override_now: datetime | None = None,
-) -> PreviewResult:
-    """
-    Build the leaderboard text without sending and explain per-key emoji sources.
-    """
-    layout = await render_preview_layout(
-        live_seen_snapshot=live_seen_snapshot,
-        session_accum_secs=session_accum_secs,
-        session_qualified=session_qualified,
-        override_now=override_now,
-    )
-    per_key_sources = PremiumEmojiResolver.per_key_sources()
-    breakdown = PremiumEmojiResolver.resolution_breakdown()
-    mode = PremiumEmojiResolver.resolution_mode()
-
-    widest_key = max((len(key) for key in per_key_sources), default=1)
-    header = f"{'KEY'.ljust(widest_key)} | SOURCE"
-    divider = "-" * len(header)
-    rows = [header, divider]
-    for key in sorted(per_key_sources):
-        rows.append(f"{key.ljust(widest_key)} | {per_key_sources[key]}")
-    explain_table = "\n".join(rows)
-
-    return PreviewResult(
-        message_text=layout.rendered_text,
-        html_text=layout.html_text,
-        explain_table=explain_table,
-        per_key_sources=per_key_sources,
-        breakdown=breakdown,
-        mode=mode,
-    )
-
-
-async def _periodic_emoji_refresh():
-    while True:
-        try:
-            changed = await PremiumEmojiResolver.refresh_if_needed(client)
-            if not PremiumEmojiResolver.last_refresh_success():
-                logger.warning("emoji hydrate attempt failed; using cached data")
-            elif changed:
-                logger.info("emoji_cache_refreshed fingerprint=%s", PremiumEmojiResolver.fingerprint_short())
-        except Exception as exc:
-            _log_exc("emoji_periodic_refresh", exc)
-        await asyncio.sleep(HYDRATE_INTERVAL_SEC)
-
-
-async def _periodic_emoji_report():
-    while True:
-        await asyncio.sleep(EMOJI_STATUS_INTERVAL_SEC)
-        try:
-            _log_emoji_counts("emoji_counts_periodic")
-        except Exception as exc:
-            _log_exc("emoji_periodic_report", exc)
-
-
-def _log_emoji_counts(label: str) -> None:
-    breakdown = PremiumEmojiResolver.resolution_breakdown()
-    counts = PremiumEmojiResolver.counts()
-    missing = breakdown.get("FALLING_BACK", [])
-    fingerprint = PremiumEmojiResolver.current_fingerprint() or "none"
-    duplicates = PremiumEmojiResolver.duplicate_keys()
-    duplicates_str = ", ".join(f"{k}:{v}" for k, v in sorted(duplicates.items())) or "(none)"
-    logger.info(
-        "%s emoji_mode=%s mapped_premium=%d pinned_unicode=%d normal_fallback=%d missing_keys=%s fingerprint=%s duplicate_keys=%s",
-        label,
-        PremiumEmojiResolver.current_policy(),
-        counts.get("mapped_premium", 0),
-        counts.get("pinned_unicode", 0),
-        counts.get("normal_fallback", 0),
-        missing,
-        fingerprint,
-        duplicates_str,
-    )
-
 
 async def _admin_post_now(chat_id):
     try:
@@ -1465,140 +1153,6 @@ async def _handle_admin_command(event):
                 await event.respond(chunk)
         except Exception as exc:
             await event.respond(f'Audit failed: {exc}')
-        return
-    if lowered.startswith('.emoji'):
-        parts = text.split()
-        if len(parts) == 1:
-            await event.respond('Usage: .emoji status|refresh|policy [mode]|export_template|diff|explain <KEY>|test medals')
-            return
-        action = parts[1].strip().lower()
-        if action == 'status':
-            await PremiumEmojiResolver.refresh_if_needed(client)
-            counts = PremiumEmojiResolver.counts()
-            breakdown = PremiumEmojiResolver.resolution_breakdown()
-            preview = await render_preview()
-            table_lines = preview.explain_table.splitlines()[:10]
-            premium_flag = PremiumEmojiResolver.premium_status()
-            if premium_flag is None:
-                premium_display = "unknown"
-            else:
-                premium_display = "true" if premium_flag else "false"
-            mapped_list = ', '.join(breakdown.get('MAPPED_PREMIUM', [])) or '(none)'
-            unicode_list = ', '.join(breakdown.get('PINNED_UNICODE', [])) or '(none)'
-            fallback_list = ', '.join(breakdown.get('FALLING_BACK', [])) or '(none)'
-            duplicates = PremiumEmojiResolver.duplicate_keys()
-            duplicate_list = ', '.join(f"{k}({v})" for k, v in sorted(duplicates.items())) or '(none)'
-            response = (
-                f"emoji_policy: {PremiumEmojiResolver.current_policy()} (premium={premium_display} source={PremiumEmojiResolver.policy_source()})\n"
-                f"resolution_mode: {preview.mode}\n"
-                f"fingerprint: {PremiumEmojiResolver.fingerprint_short()}\n"
-                f"counts: premium={counts['mapped_premium']} unicode={counts['pinned_unicode']} normal={counts['normal_fallback']}\n"
-                f"MAPPED_PREMIUM: {mapped_list}\n"
-                f"PINNED_UNICODE: {unicode_list}\n"
-                f"NORMAL_FALLBACK: {fallback_list}\n"
-                f"DUPLICATE_KEYS: {duplicate_list}\n\n"
-                + "\n".join(table_lines)
-            )
-
-            await event.respond(response)
-            return
-        if action == 'refresh':
-            changed = await PremiumEmojiResolver.refresh_if_needed(client, force=True)
-            if not PremiumEmojiResolver.last_refresh_success():
-                await event.respond('Hydrate failed; using previous cache.')
-            else:
-                if changed:
-                    _log_emoji_counts('emoji_counts_manual_refresh')
-                status = 'updated' if changed else 'unchanged'
-                await event.respond(f'Hydrate {status}. fingerprint={PremiumEmojiResolver.fingerprint_short()}')
-            return
-        if action == 'export_template':
-            await PremiumEmojiResolver.refresh_if_needed(client)
-            template_text, template_entities = PremiumEmojiResolver.export_template()
-            if not template_text:
-                template_text = '(no keys)'
-            formatting = template_entities if template_entities else None
-            await event.respond(template_text, formatting_entities=formatting)
-            return
-        if action == 'diff':
-            await PremiumEmojiResolver.refresh_if_needed(client)
-            missing_keys = PremiumEmojiResolver.keys_missing_from_pinned()
-            if not missing_keys:
-                await event.respond('Pinned note already defines every key.')
-            else:
-                await event.respond('Missing keys: ' + ', '.join(missing_keys))
-            return
-        if action == 'explain':
-            if len(parts) < 3:
-                await event.respond('Usage: .emoji explain <KEY>')
-                return
-            key = parts[2].strip().upper()
-            if key not in NORMAL_SET:
-                await event.respond(f'Unknown key: {key}')
-                return
-            glyph, document_id, source = PremiumEmojiResolver.emoji_for_key(key)
-            glyph_display = glyph or '(empty)'
-            await event.respond(
-                f"{key}: source={source} glyph={glyph_display} premium_id={document_id}"
-            )
-            return
-        if action == 'test':
-            if len(parts) < 3:
-                await event.respond('Usage: .emoji test medals')
-                return
-            target = parts[2].strip().lower()
-            if target == 'medals':
-                result = PremiumEmojiResolver.selfcheck_medals()
-                lines = ['medals self-check:']
-                for policy in ('pinned_prefer', 'pinned_strict'):
-                    policy_result = result.get(policy) or {}
-                    for label in ('two_entries', 'three_entries'):
-                        entry = policy_result.get(label) or {}
-                        tokens = entry.get('tokens') or []
-                        sources = [t.get('source') for t in tokens]
-                        doc_ids = [t.get('document_id') for t in tokens]
-                        glyphs = [t.get('glyph') for t in tokens]
-                        lines.append(
-                            f"{policy} {label}: sources={sources} doc_ids={doc_ids} glyphs={glyphs}"
-                        )
-                await event.respond('\n'.join(lines))
-                return
-            await event.respond('Unknown test name.')
-            return
-        if action == 'policy':
-            if len(parts) == 2:
-                premium_flag = PremiumEmojiResolver.premium_status()
-                if premium_flag is None:
-                    premium_display = "unknown"
-                else:
-                    premium_display = "true" if premium_flag else "false"
-                await event.respond(
-                    f"emoji_policy: {PremiumEmojiResolver.current_policy()} (premium={premium_display} source={PremiumEmojiResolver.policy_source()})"
-                )
-                return
-            mode = parts[2].strip()
-            previous_policy = PremiumEmojiResolver.current_policy()
-            try:
-                PremiumEmojiResolver.set_policy(mode)
-            except ValueError:
-                await event.respond('Invalid policy. Options: pinned_strict, pinned_prefer, code_only.')
-                return
-            logger.info(
-                "emoji_policy_admin_change policy=%s previous=%s admin=%s",
-                PremiumEmojiResolver.current_policy(),
-                previous_policy,
-                getattr(event, "sender_id", None),
-            )
-            premium_flag = PremiumEmojiResolver.premium_status()
-            if premium_flag is None:
-                premium_display = "unknown"
-            else:
-                premium_display = "true" if premium_flag else "false"
-            await event.respond(
-                f"Policy updated to {PremiumEmojiResolver.current_policy()} (premium={premium_display} source={PremiumEmojiResolver.policy_source()})."
-            )
-            return
-        await event.respond('Unknown .emoji command.')
         return
     if lowered.startswith('.layout'):
         parts = text.split()
@@ -1927,25 +1481,8 @@ async def main():
     STATE.ent = await resolve_group(GROUP)
     _maybe_reset_on_group_change(STATE.ent)
 
-    hydrate_status = await PremiumEmojiResolver.refresh_if_needed(client, force=True)
-    if not PremiumEmojiResolver.last_refresh_success():
-        logger.warning('emoji hydrate failed on startup; using cached data')
-    else:
-        status = 'updated' if hydrate_status else 'unchanged'
-        logger.info('emoji hydrate startup status=%s fingerprint=%s', status, PremiumEmojiResolver.fingerprint_short())
-    logger.info(
-        "emoji policy startup policy=%s source=%s env=%s",
-        PremiumEmojiResolver.current_policy(),
-        PremiumEmojiResolver.policy_source(),
-        os.environ.get("EMOJI_POLICY"),
-    )
-    _log_emoji_counts('emoji_counts_startup')
-    asyncio.create_task(_periodic_emoji_refresh())
-    asyncio.create_task(_periodic_emoji_report())
-
     print("Tracker running. Will post automatically at 21:00 Asia/Tashkent.")
     me = await client.get_me()
-    PremiumEmojiResolver.register_premium_status(bool(getattr(me, "premium", False)))
     MY_ID = me.id
     print("Running as user id:", MY_ID)
 
