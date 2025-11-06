@@ -11,7 +11,7 @@
 import asyncio, time, re, sqlite3, os, sys, traceback, random, html, json, copy
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, Match, NamedTuple, Optional
 
 # ---- Local environment loader ----
 def _load_local_env() -> None:
@@ -64,6 +64,7 @@ EM_DASH = NORMAL_SET["EM_DASH"]
 RANGE_SEP = NORMAL_SET["RANGE_SEP"]
 BULLET = NORMAL_SET["BULLET"]
 WOTD_MARK = NORMAL_SET["WOTD_MARK"]
+_TOKEN_PLACEHOLDER_RE = re.compile(r"\{([A-Z0-9_]+)\}")
 
 # ---- Windows single-instance guard (coexists with PS1 mutex) ----
 import ctypes, ctypes.wintypes
@@ -836,13 +837,34 @@ def _tokenize_plain_text(text: str) -> tuple[str, List[_TokenMatch]]:
     return "".join(parts), tokens
 
 
-def _token_metadata_for_logging(html_text: str) -> List[Dict[str, Any]]:
+def _token_metadata_for_logging(html_text: str, *, prefer_fallback: bool = False) -> List[Dict[str, Any]]:
     plain_text, _ = tele_html.parse(html_text)
     tokenized_text, tokens = _tokenize_plain_text(plain_text)
     if not tokens:
         return []
     _, _, _, metadata = PremiumEmojiResolver.render_with_sources(tokenized_text)
+    if prefer_fallback:
+        for item in metadata:
+            if item.get("document_id") is not None:
+                item["document_id"] = None
+                source = item.get("source", "")
+                item["source"] = f"FALLBACK_{source}" if source else "FALLBACK"
     return metadata
+
+
+def _render_html_with_token_fallbacks(html_text: str) -> str:
+    """
+    Replace {TOKEN} placeholders with non-premium glyphs so fallback HTML posts render cleanly.
+    """
+
+    def _replacement(match: Match[str]) -> str:
+        key = match.group(1)
+        glyph, document_id, _ = PremiumEmojiResolver.emoji_for_key(key)
+        if document_id is not None:
+            return NORMAL_SET.get(key, glyph or "")
+        return glyph or NORMAL_SET.get(key, "")
+
+    return _TOKEN_PLACEHOLDER_RE.sub(_replacement, html_text)
 
 
 def _offset_stage0_to_stage1(tokens: List[_TokenMatch], offset: int) -> Optional[int]:
@@ -1174,8 +1196,9 @@ async def post_leaderboard(
         sent_message = premium_result.message
         token_metadata = premium_result.metadata
     else:
-        sent_message = await _send_message_with_retry(ent, msg, parse_mode="html")
-        token_metadata = _token_metadata_for_logging(msg)
+        token_metadata = _token_metadata_for_logging(msg, prefer_fallback=True)
+        fallback_html = _render_html_with_token_fallbacks(msg)
+        sent_message = await _send_message_with_retry(ent, fallback_html, parse_mode="html")
     if mark_daily:
         db_set_meta("last_post_date", now.date().isoformat())
     print(f"Posted leaderboard for {now.date().isoformat()} (mark_daily={mark_daily}).")
