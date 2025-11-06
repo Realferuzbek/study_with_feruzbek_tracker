@@ -1181,6 +1181,9 @@ async def post_leaderboard(
     except Exception:
         premium_capable = False
 
+    # NEW: auto-enable pinned emoji mapping for premium accounts
+    PremiumEmojiResolver.set_policy("pinned_prefer" if premium_capable else "code_only")
+
     if premium_capable:
         try:
             premium_result = await _try_send_premium(client, ent, msg)

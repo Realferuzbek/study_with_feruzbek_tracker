@@ -145,7 +145,7 @@ class PremiumEmojiResolver:
     message in Saved Messages. Results are cached on disk.
     """
     _ALLOWED_POLICIES = {"pinned_strict", "pinned_prefer", "code_only"}
-    _DEFAULT_POLICY = "code_only"
+    _DEFAULT_POLICY = "pinned_prefer"  # use pinned set when available; fallback to Unicode for missing keys
     _SCHEMA_VERSION = 3
     _cache_path = Path(__file__).with_name("premium_emoji_cache.json")
     _lock = asyncio.Lock()
