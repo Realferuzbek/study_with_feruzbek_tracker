@@ -133,9 +133,8 @@ SNAPSHOT_POLL_EVERY  = 30
 FLUSH_EVERY  = 600  # 10 minutes
 
 # Daily post time (Asia/Tashkent)
-POST_HOUR    = 22
-POST_MINUTE  = 0
-
+POST_HOUR    = 21
+POST_MINUTE  = 30
 DB_PATH      = "study.db"
 
 # Display / compliments
@@ -691,6 +690,7 @@ def _unique_sorted(rows):
     return sorted(best.items(), key=lambda x: x[1], reverse=True)
 
 def _b(s: str) -> str: return f"<b>{html.escape(s)}</b>"
+def _i(s: str) -> str: return f"<i>{html.escape(s)}</i>"
 
 # ---- Force compliment emojis to the END ----
 _EMOJI_LEAD_RE = re.compile(r'^\s*([\u2600-\u27BF\uFE0F\U0001F300-\U0001FAFF]+)\s*(.+)$')
@@ -941,7 +941,7 @@ async def _build_leaderboard_context(
     if q:
         motd_lines = [
             _b(f"WORD OF THE DAY {WOTD_MARK}"),
-            _b(f"{QUOTE_L}{q}{QUOTE_R}"),
+            f"<blockquote>{_i(q)}</blockquote>",
         ]
     motd = "\n".join(motd_lines) if motd_lines else ""
 
@@ -1084,8 +1084,8 @@ def _audit_layout_text(text: str) -> tuple[bool, str]:
     motd_header = f"WORD OF THE DAY {WOTD_MARK}"
     if motd_header in lines:
         idx = lines.index(motd_header)
-        if idx + 1 >= len(lines) or not (lines[idx + 1].startswith(QUOTE_L) and lines[idx + 1].endswith(QUOTE_R)):
-            return False, "WORD OF THE DAY quote missing smart quotes"
+        if idx + 1 >= len(lines) or not lines[idx + 1]:
+            return False, "WORD OF THE DAY line missing text"
     if any("  " in ln for ln in lines):
         return False, "double spaces detected"
     for idx, line in enumerate(lines[2:], start=3):
