@@ -1,5 +1,6 @@
 # F:\study_with_me\reset_all.py
-import sqlite3, os
+import sqlite3
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 try:
     from zoneinfo import ZoneInfo
@@ -7,12 +8,16 @@ try:
 except Exception:
     TZ = timezone(timedelta(hours=5))
 
-DB = r"F:\study_with_me\study.db"
+BASE_DIR = Path(__file__).resolve().parent
+VAR_DIR = BASE_DIR / "var"
+VAR_DIR.mkdir(parents=True, exist_ok=True)
+DB = VAR_DIR / "study.db"
+POST_NOW_FLAG = BASE_DIR / "post_now.flag"
 
 def set_meta(cur, k, v):
     cur.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (k, v))
 
-con = sqlite3.connect(DB, timeout=30)
+con = sqlite3.connect(str(DB), timeout=30)
 cur = con.cursor()
 # wipe totals + compliments
 cur.execute("DELETE FROM seconds_totals")
@@ -26,7 +31,7 @@ set_meta(cur, "group_since", anchor)
 con.commit()
 con.close()
 
-try: os.remove(r"F:\study_with_me\post_now.flag")
+try: POST_NOW_FLAG.unlink()
 except FileNotFoundError: pass
 
 print(f"Reset done. New anchor_date={anchor}. Next post will be DAY 1, WEEK 1, MONTH 1 from this date.")

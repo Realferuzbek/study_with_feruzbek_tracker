@@ -92,7 +92,7 @@ async def list_participants(input_call):
 async def main():
     await client.connect()
     if not await client.is_user_authorized():
-        print("Not logged in. Run login_qr.py first.")
+        print("Not logged in. Run tg_session_qr.py first to generate a string session.")
         return
 
     ent = await resolve_group(GROUP)

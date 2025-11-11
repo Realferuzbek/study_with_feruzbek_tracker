@@ -1,8 +1,12 @@
 # F:\study_with_me\meta_tool.py
 import sqlite3, sys, datetime
+from pathlib import Path
 
-DB = r"F:\study_with_me\study.db"
-con = sqlite3.connect(DB); cur = con.cursor()
+BASE_DIR = Path(__file__).resolve().parent
+VAR_DIR = BASE_DIR / "var"
+VAR_DIR.mkdir(parents=True, exist_ok=True)
+DB = VAR_DIR / "study.db"
+con = sqlite3.connect(str(DB)); cur = con.cursor()
 
 def show():
     print("== meta ==")

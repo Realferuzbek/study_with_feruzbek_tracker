@@ -10,4 +10,4 @@
 - `.layout audit` – checks the current preview text for formatting issues.
 - `.layout preview` – sends the raw HTML preview to chat.
 - `.post now` – queues a manual leaderboard post without touching the daily flag.
-- `.logs tail [n]` – echoes the last `n` lines from `tracker.log` (defaults to 50).
+- `.logs tail [n]` – echoes the last `n` lines from `var/tracker.log` (defaults to 50).

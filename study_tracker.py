@@ -168,9 +168,12 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 BASE_DIR = Path(__file__).resolve().parent
-LOG_FILE = BASE_DIR / "tracker.log"
-ROTATED = BASE_DIR / "tracker_2.log"
+VAR_DIR = BASE_DIR / "var"
+VAR_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = VAR_DIR / "tracker.log"
+ROTATED = VAR_DIR / "tracker_2.log"
 HEARTBEAT_FILE = BASE_DIR / "tracker.lock"
+DB_PATH = VAR_DIR / "study.db"
 
 fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=1, encoding="utf-8")
 def _namer(default_name: str):
@@ -208,7 +211,6 @@ FLUSH_EVERY  = 600  # 10 minutes
 # Daily post time (Asia/Tashkent)
 POST_HOUR    = 21
 POST_MINUTE  = 30
-DB_PATH      = "study.db"
 
 # Display / compliments
 SHOW_MAX_PER_LIST = 10
@@ -414,7 +416,7 @@ def assert_session_free():
 
 # ---------- DB helpers ----------
 def _con():
-    con = sqlite3.connect(DB_PATH, timeout=30)
+    con = sqlite3.connect(str(DB_PATH), timeout=30)
     try: con.execute("PRAGMA journal_mode=WAL")
     except Exception: pass
     return con

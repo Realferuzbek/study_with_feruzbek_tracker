@@ -17,11 +17,9 @@ yarn-error.log*
 runner-*.log
 runner.log
 *.log.*
-!tracker.log
-!tracker_2.log
 
 # Python / local stuff
-pycache/
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
@@ -31,8 +29,6 @@ manual_stop.flag
 .env
 .env.*
 *.db
-!study.db
-node_modules/
 # --- SWM security block (do not remove) ---
 *.session
 *.session-journal
