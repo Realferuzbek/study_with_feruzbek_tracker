@@ -8,7 +8,7 @@
 # - Daily auto post at 22:00 Asia/Tashkent
 # - Manual "post now" without breaking daily schedule (post_now.flag)
 
-import asyncio, time, re, sqlite3, os, sys, traceback, random, html, json
+import asyncio, time, re, sqlite3, os, sys, traceback, random, html, json, urllib.parse, urllib.request, urllib.error
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional
@@ -42,6 +42,80 @@ def _load_local_env() -> None:
 
 
 _load_local_env()
+
+def _strip_or_none(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _require_env(name: str) -> str:
+    value = _strip_or_none(os.getenv(name))
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def _require_int_env(name: str) -> int:
+    value = _require_env(name)
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer.") from exc
+
+
+def _normalize_username(value: str | None) -> str:
+    value = (_strip_or_none(value) or "").lstrip("@")
+    return value
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _maybe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_bot_chat_target(group_username: str) -> str | None:
+    candidate = _strip_or_none(os.getenv("TELEGRAM_BOT_TARGET"))
+    if candidate and not candidate.startswith("@") and not candidate.startswith("-"):
+        candidate = f"@{candidate}"
+    if candidate:
+        return candidate
+    candidate = _strip_or_none(os.getenv("TELEGRAM_GROUP_ID"))
+    if candidate:
+        return candidate
+    if group_username:
+        return f"@{group_username}"
+    return None
+
+
+# ---- Critical credentials ----
+API_ID = _require_int_env("TELEGRAM_API_ID")
+API_HASH = _require_env("TELEGRAM_API_HASH")
+SESSION = _strip_or_none(os.getenv("TELEGRAM_SESSION_NAME")) or "study_session"
+GROUP = _normalize_username(os.getenv("TELEGRAM_GROUP_USERNAME") or "studywithferuzbek")
+if not GROUP:
+    raise RuntimeError("TELEGRAM_GROUP_USERNAME is required.")
+
+BOT_TOKEN = _strip_or_none(os.getenv("TELEGRAM_BOT_TOKEN")) or ""
+BOT_USERNAME = _normalize_username(os.getenv("TELEGRAM_BOT_USERNAME"))
+BOT_CHAT_TARGET = _resolve_bot_chat_target(GROUP)
+BOT_API_BASE = _strip_or_none(os.getenv("TELEGRAM_BOT_API_BASE")) or "https://api.telegram.org"
+BOT_HTTP_TIMEOUT = int(os.getenv("TELEGRAM_BOT_HTTP_TIMEOUT", "20"))
+BOT_DISABLE_WEB_PREVIEW = _env_flag("TELEGRAM_BOT_DISABLE_WEB_PREVIEW", True)
+BOT_STRICT_FAILURE = _env_flag("TELEGRAM_BOT_STRICT", True)
+
+if BOT_TOKEN and not BOT_CHAT_TARGET:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is set but no TELEGRAM_GROUP_ID/TELEGRAM_BOT_TARGET could be resolved.")
 
 # ---- Timezone (Asia/Tashkent) with fallback ----
 try:
@@ -118,14 +192,6 @@ def _log_exc(label: str, e: Exception):
     except Exception:
         pass
 
-# =================== CONFIG ===================
-API_ID   = 27333292
-API_HASH = "d8e1fbba6f100090d6876036ccb121df"
-SESSION  = "study_session"                    # single session file
-
-# >>> SET THIS EXACTLY TO YOUR GROUP USERNAME (no https://t.me/ or @)
-GROUP = "studywithferuzbek"
-
 # Fallback snapshot poll (safety net). 30s is fine.
 SNAPSHOT_POLL_EVERY  = 30
 
@@ -182,6 +248,33 @@ HEARTBEAT_THRESHOLDS = [300, 600, 900]   # alert at 5, 10, 15 minutes since last
 client = TelegramClient(SESSION, API_ID, API_HASH)
 MY_ID: int | None = None
 
+class LeaderboardSendResult(NamedTuple):
+    chat_id: int | None
+    message_id: int | None
+    transport: str
+
+
+def _bot_api_request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not BOT_TOKEN:
+        raise RuntimeError("Bot token is not configured.")
+    url = f"{BOT_API_BASE}/bot{BOT_TOKEN}/{method}"
+    data = urllib.parse.urlencode(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=BOT_HTTP_TIMEOUT) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Bot API HTTP {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Bot API network error: {exc}") from exc
+    return json.loads(raw.decode("utf-8"))
+
+
 async def _send_message_with_retry(target, *args, **kwargs):
     try:
         return await client.send_message(target, *args, **kwargs)
@@ -190,6 +283,50 @@ async def _send_message_with_retry(target, *args, **kwargs):
         logger.warning("FloodWait %s s encountered; retrying once", wait)
         await asyncio.sleep(wait)
         return await client.send_message(target, *args, **kwargs)
+
+
+async def _send_leaderboard_message(ent, html_text: str) -> LeaderboardSendResult:
+    if BOT_TOKEN:
+        payload = {
+            "chat_id": BOT_CHAT_TARGET,
+            "text": html_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true" if BOT_DISABLE_WEB_PREVIEW else "false",
+        }
+        try:
+            resp = await asyncio.to_thread(_bot_api_request, "sendMessage", payload)
+        except Exception as exc:
+            _log_exc("Bot send failed", exc)
+            if BOT_STRICT_FAILURE:
+                raise
+            logger.warning("Bot send failed; falling back to user session.")
+        else:
+            if not resp.get("ok"):
+                err = resp.get("description") or resp
+                raise RuntimeError(f"Bot API sendMessage error: {err}")
+            result = resp.get("result") or {}
+            chat = result.get("chat") or {}
+            send_result = LeaderboardSendResult(
+                chat_id=_maybe_int(chat.get("id")),
+                message_id=_maybe_int(result.get("message_id")),
+                transport="bot",
+            )
+            bot_identity = f"@{BOT_USERNAME}" if BOT_USERNAME else BOT_CHAT_TARGET
+            logger.info("leaderboard_sent transport=bot via=%s target=%s", bot_identity, BOT_CHAT_TARGET)
+            return send_result
+
+    sent_message = await _send_message_with_retry(ent, html_text, parse_mode="html")
+    try:
+        chat_id = int(get_peer_id(ent))
+    except Exception:
+        chat_id = getattr(getattr(sent_message, "peer_id", None), "channel_id", None)
+    send_result = LeaderboardSendResult(
+        chat_id=_maybe_int(chat_id),
+        message_id=_maybe_int(getattr(sent_message, "id", None)),
+        transport="user",
+    )
+    logger.info("leaderboard_sent transport=user target=%s", GROUP)
+    return send_result
 
 
 # ---------- NEW: Heartbeat / state (1/6) ----------
@@ -1010,19 +1147,16 @@ async def post_leaderboard(
     m_start = context["m_start"]
     m_end = context["m_end"]
 
-    sent_message = await _send_message_with_retry(ent, msg, parse_mode="html")
-    logger.info("leaderboard_sent mode=unicode")
+    send_result = await _send_leaderboard_message(ent, msg)
     if mark_daily:
         db_set_meta("last_post_date", now.date().isoformat())
     print(f"Posted leaderboard for {now.date().isoformat()} (mark_daily={mark_daily}).")
 
-    try:
-        chat_id = int(get_peer_id(ent))
-    except Exception:
-        chat_id = getattr(getattr(sent_message, "peer_id", None), "channel_id", None)
+    chat_id = send_result.chat_id
     snapshot = {
         "posted_at": datetime.now(timezone.utc).isoformat(),
-        "message_id": getattr(sent_message, "id", None),
+        "message_id": send_result.message_id,
+        "transport": send_result.transport,
         "chat_id": chat_id,
         "boards": [
             {
@@ -1203,15 +1337,18 @@ if ADMIN_CHAT_ID is not None:
 # ---------- Event-driven participant tracking ----------
 class _State:
     ent = None
-    seen: dict[int, float] = {}             # active start ts per uid (raw ids)
+    seen: dict[int, float] = {}             # canonical uid -> active start ts
+    raw_active: set[int] = set()            # raw participant ids currently counted
+    raw_to_canon: dict[int, int] = {}       # raw uid -> canonical uid snapshot when they joined
+    canon_active_counts: dict[int, int] = {}# canonical uid -> number of active raw aliases
     last_flush_ts: float = time.time()
     refresh_task: asyncio.Task | None = None
 
     # Per-session gating state
     current_call_id: int | None = None
-    pending_segments: dict[int, list[tuple[float, float]]] = {}  # uid -> list of (start,end) waiting to be gated/committed
-    session_accum_secs: dict[int, int] = {}     # uid -> total seconds accrued this session (sum of pending + committed this session)
-    session_qualified: dict[int, bool] = {}     # uid -> has crossed SESSION_MIN_SECONDS in this session
+    pending_segments: dict[int, list[tuple[float, float]]] = {}  # canonical uid -> list of (start,end) pending segments
+    session_accum_secs: dict[int, int] = {}     # canonical uid -> total seconds accrued this session
+    session_qualified: dict[int, bool] = {}     # canonical uid -> has crossed SESSION_MIN_SECONDS in this session
 
     # Quiet logging controls
     call_active: bool = False
@@ -1225,11 +1362,31 @@ class _State:
 
 STATE = _State()
 
+def _record_interval(uid: int, start_ts: float, end_ts: float):
+    """Accrue an interval for a canonical user, honoring the session gate."""
+    if uid is None or end_ts <= start_ts:
+        return
+    dur = int(end_ts - start_ts)
+    total = STATE.session_accum_secs.get(uid, 0) + dur
+    STATE.session_accum_secs[uid] = total
+    if STATE.session_qualified.get(uid, False):
+        db_add_span(uid, start_ts, end_ts)
+        return
+    STATE.pending_segments.setdefault(uid, []).append((start_ts, end_ts))
+    if total >= SESSION_MIN_SECONDS:
+        for (s, e) in STATE.pending_segments.get(uid, []):
+            db_add_span(uid, s, e)
+        STATE.pending_segments[uid] = []
+        STATE.session_qualified[uid] = True
+
 def _start_new_session(call_id: int):
     STATE.current_call_id = call_id
     STATE.pending_segments = {}
     STATE.session_accum_secs = {}
     STATE.session_qualified = {}
+    STATE.raw_active = set()
+    STATE.raw_to_canon = {}
+    STATE.canon_active_counts = {}
     STATE.seen = {}
     STATE.last_flush_ts = time.time()
     print(f"[session] New group call id={call_id} started; gating <{SESSION_MIN_SECONDS}s per session.")
@@ -1240,7 +1397,12 @@ def _finalize_session(now_ts: float):
         if now_ts > start_ts:
             STATE.pending_segments.setdefault(uid, []).append((start_ts, now_ts))
             STATE.session_accum_secs[uid] = STATE.session_accum_secs.get(uid, 0) + int(now_ts - start_ts)
+    for uid, start_ts in list(STATE.seen.items()):
+        _record_interval(uid, start_ts, now_ts)
     STATE.seen.clear()
+    STATE.raw_active.clear()
+    STATE.raw_to_canon.clear()
+    STATE.canon_active_counts.clear()
 
     for uid, segs in list(STATE.pending_segments.items()):
         total = STATE.session_accum_secs.get(uid, 0)
@@ -1324,22 +1486,13 @@ async def _refresh_snapshot():
         if STATE.seen and (now_ts - STATE.last_flush_ts) >= FLUSH_EVERY:
             for uid, start_ts in list(STATE.seen.items()):
                 if now_ts > start_ts:
-                    dur = int(now_ts - start_ts)
-                    if STATE.session_qualified.get(uid, False):
-                        db_add_span(uid, start_ts, now_ts)
-                    else:
-                        STATE.pending_segments.setdefault(uid, []).append((start_ts, now_ts))
-                        STATE.session_accum_secs[uid] = STATE.session_accum_secs.get(uid, 0) + dur
-                        if STATE.session_accum_secs[uid] >= SESSION_MIN_SECONDS:
-                            for (s, e) in STATE.pending_segments.get(uid, []):
-                                db_add_span(uid, s, e)
-                            STATE.pending_segments[uid] = []
-                            STATE.session_qualified[uid] = True
+                    _record_interval(uid, start_ts, now_ts)
                     STATE.seen[uid] = now_ts
             STATE.last_flush_ts = now_ts
             print("[flush] checkpointed active users")
 
         participants = await fetch_participants(call)
+        alias_to_canon, canon_label = _alias_maps_from_cache()
         current = set()
         for uid, _, _ in participants:
             if not uid:
@@ -1350,31 +1503,37 @@ async def _refresh_snapshot():
 
         # joins
         for uid in current:
-            if uid not in STATE.seen:
-                STATE.seen[uid] = now_ts
+            if uid in STATE.raw_active:
+                continue
+            STATE.raw_active.add(uid)
+            canon_uid = STATE.raw_to_canon.get(uid)
+            if canon_uid is None:
+                canon_uid = alias_to_canon.get(uid, uid)
+                STATE.raw_to_canon[uid] = canon_uid
+            prev = STATE.canon_active_counts.get(canon_uid, 0)
+            STATE.canon_active_counts[canon_uid] = prev + 1
+            if prev == 0:
+                STATE.seen[canon_uid] = now_ts
 
         # leaves
-        for uid in list(STATE.seen.keys()):
-            if uid not in current:
-                start_ts = STATE.seen.pop(uid)
-                if now_ts <= start_ts:
-                    continue
-                dur = int(now_ts - start_ts)
-                if STATE.session_qualified.get(uid, False):
-                    db_add_span(uid, start_ts, now_ts)
-                    STATE.session_accum_secs[uid] = STATE.session_accum_secs.get(uid, 0) + dur
-                else:
-                    STATE.pending_segments.setdefault(uid, []).append((start_ts, now_ts))
-                    STATE.session_accum_secs[uid] = STATE.session_accum_secs.get(uid, 0) + dur
-                    if STATE.session_accum_secs[uid] >= SESSION_MIN_SECONDS:
-                        for (s, e) in STATE.pending_segments.get(uid, []):
-                            db_add_span(uid, s, e)
-                        STATE.pending_segments[uid] = []
-                        STATE.session_qualified[uid] = True
+        for uid in list(STATE.raw_active):
+            if uid in current:
+                continue
+            STATE.raw_active.remove(uid)
+            canon_uid = STATE.raw_to_canon.pop(uid, alias_to_canon.get(uid, uid))
+            if canon_uid is None:
+                continue
+            prev = STATE.canon_active_counts.get(canon_uid, 0) - 1
+            if prev <= 0:
+                STATE.canon_active_counts.pop(canon_uid, None)
+                start_ts = STATE.seen.pop(canon_uid, None)
+                if start_ts is not None:
+                    _record_interval(canon_uid, start_ts, now_ts)
+            else:
+                STATE.canon_active_counts[canon_uid] = prev
 
         # Roster log (canonical labels) — only on change / every few minutes
         STATE.call_active = True
-        alias_to_canon, canon_label = _alias_maps_from_cache()
         names_now, ids_for_sig = [], []
         for uid, n, _ in participants:
             if not n or (not TRACK_SELF and uid == MY_ID):
