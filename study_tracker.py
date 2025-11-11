@@ -101,7 +101,13 @@ def _resolve_bot_chat_target(group_username: str) -> str | None:
 # ---- Critical credentials ----
 API_ID = _require_int_env("TELEGRAM_API_ID")
 API_HASH = _require_env("TELEGRAM_API_HASH")
-SESSION = _strip_or_none(os.getenv("TELEGRAM_SESSION_NAME")) or "study_session"
+SESSION_FILE_BASENAME = _strip_or_none(os.getenv("TELEGRAM_SESSION_NAME")) or "study_session"
+STRING_SESSION = _strip_or_none(os.getenv("TG_STRING_SESSION"))
+if not STRING_SESSION:
+    raise RuntimeError(
+        "Missing required environment variable TG_STRING_SESSION. "
+        "Generate a Telethon StringSession and keep it outside git history."
+    )
 GROUP = _normalize_username(os.getenv("TELEGRAM_GROUP_USERNAME") or "studywithferuzbek")
 if not GROUP:
     raise RuntimeError("TELEGRAM_GROUP_USERNAME is required.")
@@ -125,6 +131,7 @@ except Exception:
     TZ = timezone(timedelta(hours=5))  # UTC+5 fallback
 
 from telethon import TelegramClient, functions, types, events
+from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 from telethon.extensions import html as tele_html
 from telethon.utils import get_peer_id
@@ -245,7 +252,7 @@ ROSTER_LOG_EVERY = 300  # seconds; only print roster at most every 5 minutes
 WATCHDOG_NOTIFY_TO = "realferuzbek"      # DM target (your main account)
 HEARTBEAT_THRESHOLDS = [300, 600, 900]   # alert at 5, 10, 15 minutes since last OK
 
-client = TelegramClient(SESSION, API_ID, API_HASH)
+client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 MY_ID: int | None = None
 
 class LeaderboardSendResult(NamedTuple):
@@ -384,7 +391,11 @@ def _save_state(d):
 
 # ---------- Guard: session file free ----------
 def assert_session_free():
-    sess_path = f"{SESSION}.session"
+    if STRING_SESSION:
+        # Using StringSession means there's no local SQLite file to guard.
+        # Keep the legacy file check for older setups just in case.
+        return
+    sess_path = f"{SESSION_FILE_BASENAME}.session"
     if not os.path.exists(sess_path):
         return
     try:
