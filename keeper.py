@@ -1,9 +1,9 @@
-import asyncio, os, json, time, subprocess, ctypes
+import asyncio, json, time, subprocess, ctypes
 from pathlib import Path
 from telethon import TelegramClient
 from telethon.errors import RPCError
 
-BASE = Path(file).resolve().parent
+BASE = Path(__file__).resolve().parent
 HEARTBEAT = BASE / "tracker.lock"
 STATE_FILE = BASE / "tracker_state.json"     # already present
 MANUAL_FLAG = BASE / "manual_stop.flag"      # created by our stop script
@@ -91,5 +91,5 @@ async def main():
 
         await asyncio.sleep(CHECK_EVERY)
 
-if name == "main":
+if __name__ == "__main__":
     asyncio.run(main())

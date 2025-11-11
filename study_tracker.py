@@ -11,7 +11,7 @@
 import asyncio, time, re, sqlite3, os, sys, traceback, random, html, json, urllib.parse, urllib.request, urllib.error
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple
 
 # ---- Local environment loader ----
 def _load_local_env() -> None:
@@ -496,7 +496,7 @@ def db_fetch_period_seconds(start_date: datetime, end_date: datetime, min_daily:
     sd = start_date.date().isoformat(); ed = end_date.date().isoformat()
     con = _con(); cur = con.cursor()
     if min_daily > 0:
-        cur.execute(f"""
+        cur.execute("""
             SELECT user_id,
                    SUM(CASE WHEN seconds >= ? THEN seconds ELSE 0 END) AS s
             FROM seconds_totals
@@ -573,7 +573,7 @@ async def _tg(req):
         return await client(req)
     except Exception as e:
         logger.debug("[tg] transient error: %r", e)
-        raise NetworkDown(str(e))
+        raise NetworkDown(str(e)) from e
 
 # ---------- Telegram helpers ----------
 async def resolve_group(target: str):

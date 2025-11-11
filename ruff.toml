@@ -1,0 +1,10 @@
+# Align linting with the tracker’s long-standing formatting.
+[lint]
+select = ["B", "D3", "E", "F"]
+ignore = [
+    "E401", # multi-import lines are intentional to keep related modules grouped
+    "E402", # env bootstrapping must run before some imports
+    "E501", # enforced by formatters instead
+    "E701", # single-line compound statements for compact helpers
+    "E702", # semicolon chaining used per legacy style
+]
