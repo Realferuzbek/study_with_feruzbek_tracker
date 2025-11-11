@@ -33,3 +33,18 @@ manual_stop.flag
 *.db
 !study.db
 node_modules/
+# --- SWM security block (do not remove) ---
+*.session
+*.session-journal
+*.db
+*.sqlite*
+*.log
+runner-*.log
+tracker*.log
+tg_login_qr.png
+*login_qr*.png
+var/**
+.env
+.env.*
+!.env.example
+# ------------------------------------------
