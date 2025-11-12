@@ -1,9 +1,19 @@
+import os
 from telethon import TelegramClient
-API_ID = 27333292
-API_HASH = "d8e1fbba6f100090d6876036ccb121df"
-SESSION = "study_session"
+from telethon.sessions import StringSession
 
-client = TelegramClient(SESSION, API_ID, API_HASH)
+from env_loader import load_project_env
+
+load_project_env()
+API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
+API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+SESSION = os.getenv("TELEGRAM_SESSION_NAME", "study_session")
+
+tg_string = os.getenv("TG_STRING_SESSION")
+if tg_string:
+    client = TelegramClient(StringSession(tg_string), API_ID, API_HASH)
+else:
+    client = TelegramClient(SESSION, API_ID, API_HASH)
 
 async def main():
     me = await client.get_me()

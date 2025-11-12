@@ -1,15 +1,25 @@
-import asyncio, time, re
+import asyncio, time, re, os
 from telethon import TelegramClient, functions, types
 from telethon.utils import get_peer_id
+from telethon.sessions import StringSession
 
-API_ID = 27333292
-API_HASH = "d8e1fbba6f100090d6876036ccb121df"
-SESSION = "study_session"
+from env_loader import load_project_env
 
-# Your group link (leave it exactly like this)
-GROUP = "https://t.me/+9if5PzRRhlFjOWRi"
+load_project_env()
 
-client = TelegramClient(SESSION, API_ID, API_HASH)
+API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
+API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+SESSION = os.getenv("TELEGRAM_SESSION_NAME", "study_session")
+GROUP = os.getenv("PUBLIC_TG_GROUP_LINK") or os.getenv("TELEGRAM_GROUP_USERNAME") or "studywithferuzbek"
+
+def _build_client():
+    tg_string = os.getenv("TG_STRING_SESSION")
+    if tg_string:
+        return TelegramClient(StringSession(tg_string), API_ID, API_HASH)
+    return TelegramClient(SESSION, API_ID, API_HASH)
+
+
+client = _build_client()
 
 async def resolve_group(target: str):
     """Resolve entity from invite link, +hash, or @username"""

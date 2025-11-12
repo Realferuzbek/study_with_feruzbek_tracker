@@ -13,35 +13,9 @@ from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple
 
-# ---- Local environment loader ----
-def _load_local_env() -> None:
-    """
-    Populate os.environ from .env.local without overruling existing variables.
-    Allows scheduler launches (which run without a shell) to see local overrides.
-    """
-    env_path = Path(__file__).with_name(".env.local")
-    try:
-        data = env_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return
-    except OSError:
-        return
+from env_loader import load_project_env
 
-    for raw_line in data.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if not key or key.startswith("#"):
-            continue
-        value = value.strip()
-        if value and ((value[0] == value[-1]) and value[0] in ("'", '"')):
-            value = value[1:-1]
-        os.environ.setdefault(key, value)
-
-
-_load_local_env()
+load_project_env()
 
 def _strip_or_none(value: str | None) -> str | None:
     if value is None:
@@ -103,11 +77,7 @@ API_ID = _require_int_env("TELEGRAM_API_ID")
 API_HASH = _require_env("TELEGRAM_API_HASH")
 SESSION_FILE_BASENAME = _strip_or_none(os.getenv("TELEGRAM_SESSION_NAME")) or "study_session"
 STRING_SESSION = _strip_or_none(os.getenv("TG_STRING_SESSION"))
-if not STRING_SESSION:
-    raise RuntimeError(
-        "Missing required environment variable TG_STRING_SESSION. "
-        "Generate a Telethon StringSession and keep it outside git history."
-    )
+USING_STRING_SESSION = bool(STRING_SESSION)
 GROUP = _normalize_username(os.getenv("TELEGRAM_GROUP_USERNAME") or "studywithferuzbek")
 if not GROUP:
     raise RuntimeError("TELEGRAM_GROUP_USERNAME is required.")
@@ -254,7 +224,12 @@ ROSTER_LOG_EVERY = 300  # seconds; only print roster at most every 5 minutes
 WATCHDOG_NOTIFY_TO = "realferuzbek"      # DM target (your main account)
 HEARTBEAT_THRESHOLDS = [300, 600, 900]   # alert at 5, 10, 15 minutes since last OK
 
-client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+if USING_STRING_SESSION:
+    _session_handle = StringSession(STRING_SESSION)
+else:
+    _session_handle = SESSION_FILE_BASENAME
+
+client = TelegramClient(_session_handle, API_ID, API_HASH)
 MY_ID: int | None = None
 
 class LeaderboardSendResult(NamedTuple):
@@ -393,7 +368,7 @@ def _save_state(d):
 
 # ---------- Guard: session file free ----------
 def assert_session_free():
-    if STRING_SESSION:
+    if USING_STRING_SESSION:
         # Using StringSession means there's no local SQLite file to guard.
         # Keep the legacy file check for older setups just in case.
         return

@@ -1,29 +1,8 @@
 import os
-from pathlib import Path
 
 from telethon import TelegramClient
 
-
-def _load_local_env() -> None:
-    """Populate os.environ from .env.local without overriding existing vars."""
-    env_path = Path(__file__).with_name(".env.local")
-    try:
-        data = env_path.read_text(encoding="utf-8")
-    except OSError:
-        return
-    for raw_line in data.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if not key:
-            continue
-        value = value.strip()
-        if value and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
-        os.environ.setdefault(key, value)
-
+from env_loader import load_project_env
 
 def _require(name: str) -> str:
     value = os.getenv(name)
@@ -32,7 +11,7 @@ def _require(name: str) -> str:
     return value
 
 
-_load_local_env()
+load_project_env()
 api_id = int(_require("TELEGRAM_API_ID"))
 api_hash = _require("TELEGRAM_API_HASH")
 session_name = os.getenv("TELEGRAM_SESSION_NAME", "study_session")

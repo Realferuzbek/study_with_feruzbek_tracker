@@ -39,7 +39,14 @@ export async function middleware(req: NextRequest) {
   let latestVersion: string | null = null;
   try {
     const stateUrl = new URL("/api/admin/state", req.url);
-    const stateRes = await fetch(stateUrl.toString(), { cache: "no-store" });
+    const headers: Record<string, string> = {};
+    if (process.env.CRON_SECRET) {
+      headers["x-cron-secret"] = process.env.CRON_SECRET;
+    }
+    const stateRes = await fetch(stateUrl.toString(), {
+      cache: "no-store",
+      headers,
+    });
     if (stateRes.ok) {
       const data = await stateRes.json();
       latestVersion = `${data?.session_version ?? 1}`;

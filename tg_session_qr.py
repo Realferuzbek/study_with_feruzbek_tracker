@@ -15,6 +15,8 @@ from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 from telethon.sessions import StringSession
 
+from env_loader import load_project_env
+
 BASE_DIR = Path(__file__).resolve().parent
 VAR_DIR = BASE_DIR / "var"
 VAR_DIR.mkdir(parents=True, exist_ok=True)
@@ -28,6 +30,7 @@ def _require(name: str) -> str:
     return input(f"{name}: ").strip()
 
 
+load_project_env()
 API_ID = int(_require("TELEGRAM_API_ID"))
 API_HASH = _require("TELEGRAM_API_HASH")
 client = TelegramClient(StringSession(), API_ID, API_HASH)

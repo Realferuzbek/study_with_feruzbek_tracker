@@ -55,3 +55,13 @@ VAPID_SUBJECT=mailto:hello@example.com
 - `npm run start` – start production server
 - `npm run lint` – run ESLint
 
+## Managing Secrets Safely
+
+Secrets now live in `var/secure_env.dat`, encrypted with Windows DPAPI. Use the helper to manage them:
+
+```bash
+python scripts/secure_env_tool.py list
+python scripts/secure_env_tool.py set TELEGRAM_API_HASH your_value_here
+```
+
+`.env.local` should only contain non-sensitive defaults. To migrate an existing plaintext file into the encrypted store run `python scripts/secure_env_tool.py migrate`.
