@@ -1383,22 +1383,12 @@ def _finalize_session(now_ts: float):
     """Close all open segments; commit those users who met the 5m gate; drop the rest."""
     for uid, start_ts in list(STATE.seen.items()):
         if now_ts > start_ts:
-            STATE.pending_segments.setdefault(uid, []).append((start_ts, now_ts))
-            STATE.session_accum_secs[uid] = STATE.session_accum_secs.get(uid, 0) + int(now_ts - start_ts)
-    for uid, start_ts in list(STATE.seen.items()):
-        _record_interval(uid, start_ts, now_ts)
+            _record_interval(uid, start_ts, now_ts)
     STATE.seen.clear()
     STATE.raw_active.clear()
     STATE.raw_to_canon.clear()
     STATE.canon_active_counts.clear()
 
-    for uid, segs in list(STATE.pending_segments.items()):
-        total = STATE.session_accum_secs.get(uid, 0)
-        qualified = total >= SESSION_MIN_SECONDS or STATE.session_qualified.get(uid, False)
-        if not qualified:
-            continue
-        for (s, e) in segs:
-            db_add_span(uid, s, e)
     STATE.pending_segments.clear()
     STATE.session_accum_secs.clear()
     STATE.session_qualified.clear()

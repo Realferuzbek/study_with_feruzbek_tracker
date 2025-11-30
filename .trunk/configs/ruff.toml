@@ -1,0 +1,10 @@
+# Generic, formatter-friendly config aligned with repo style.
+[lint]
+select = ["B", "D3", "E", "F"]
+ignore = [
+    "E401",
+    "E402",
+    "E501", # handled by formatters
+    "E701",
+    "E702",
+]
