@@ -1105,6 +1105,77 @@ async def _build_leaderboard_context(
         "month_idx": month_idx,
     }
 
+
+def _snapshot_payload_from_context(
+    context: Dict[str, Any],
+    snapshot_dt: datetime,
+    send_result: LeaderboardSendResult | None = None,
+) -> Dict[str, Any]:
+    snap_dt = snapshot_dt
+    if snap_dt.tzinfo is None:
+        snap_dt = snap_dt.replace(tzinfo=TZ)
+    else:
+        snap_dt = snap_dt.astimezone(TZ)
+
+    posted_at_iso = snap_dt.astimezone(timezone.utc).isoformat()
+    chat_id = send_result.chat_id if send_result else None
+    snapshot = {
+        "posted_at": posted_at_iso,
+        "message_id": send_result.message_id if send_result else None,
+        "transport": send_result.transport if send_result else None,
+        "chat_id": chat_id,
+        "boards": [
+            {
+                "scope": "day",
+                "title": "📅 Today",
+                "header": context["today_hdr"],
+                "period_start": context["t_start"].isoformat(),
+                "period_end": context["t_end"].isoformat(),
+                "entries": [dict(entry) for entry in context["day_entries"]],
+            },
+            {
+                "scope": "week",
+                "title": "📆 This Week",
+                "header": context["week_hdr"],
+                "period_start": context["w_start"].isoformat(),
+                "period_end": context["w_end"].isoformat(),
+                "entries": [dict(entry) for entry in context["week_entries"]],
+            },
+            {
+                "scope": "month",
+                "title": "🗓️ This Month",
+                "header": context["month_hdr"],
+                "period_start": context["m_start"].isoformat(),
+                "period_end": context["m_end"].isoformat(),
+                "entries": [dict(entry) for entry in context["month_entries"]],
+            },
+        ],
+    }
+    return snapshot
+
+
+async def build_leaderboard_snapshot(
+    snapshot_dt: datetime,
+    *,
+    live_seen_snapshot: dict[int, float] | None = None,
+    session_accum_secs: dict[int, int] | None = None,
+    session_qualified: dict[int, bool] | None = None,
+) -> Dict[str, Any]:
+    """Build the export snapshot payload for a given moment in time."""
+    snap_dt = snapshot_dt
+    if snap_dt.tzinfo is None:
+        snap_dt = snap_dt.replace(tzinfo=TZ)
+    else:
+        snap_dt = snap_dt.astimezone(TZ)
+
+    context = await _build_leaderboard_context(
+        live_seen_snapshot=live_seen_snapshot,
+        session_accum_secs=session_accum_secs,
+        session_qualified=session_qualified,
+        override_now=snap_dt,
+    )
+    return _snapshot_payload_from_context(context, snap_dt, send_result=None)
+
 async def post_leaderboard(
     ent,
     live_seen_snapshot: dict[int, float] | None = None,
@@ -1122,57 +1193,13 @@ async def post_leaderboard(
 
     msg = context["msg"]
     now = context["now"]
-    today_hdr = context["today_hdr"]
-    week_hdr = context["week_hdr"]
-    month_hdr = context["month_hdr"]
-    day_entries = context["day_entries"]
-    week_entries = context["week_entries"]
-    month_entries = context["month_entries"]
-    t_start = context["t_start"]
-    t_end = context["t_end"]
-    w_start = context["w_start"]
-    w_end = context["w_end"]
-    m_start = context["m_start"]
-    m_end = context["m_end"]
 
     send_result = await _send_leaderboard_message(ent, msg)
     if mark_daily:
         db_set_meta("last_post_date", now.date().isoformat())
     print(f"Posted leaderboard for {now.date().isoformat()} (mark_daily={mark_daily}).")
 
-    chat_id = send_result.chat_id
-    snapshot = {
-        "posted_at": datetime.now(timezone.utc).isoformat(),
-        "message_id": send_result.message_id,
-        "transport": send_result.transport,
-        "chat_id": chat_id,
-        "boards": [
-            {
-                "scope": "day",
-                "title": "📅 Today",
-                "header": today_hdr,
-                "period_start": t_start.isoformat(),
-                "period_end": t_end.isoformat(),
-                "entries": [dict(entry) for entry in day_entries],
-            },
-            {
-                "scope": "week",
-                "title": "📆 This Week",
-                "header": week_hdr,
-                "period_start": w_start.isoformat(),
-                "period_end": w_end.isoformat(),
-                "entries": [dict(entry) for entry in week_entries],
-            },
-            {
-                "scope": "month",
-                "title": "🗓️ This Month",
-                "header": month_hdr,
-                "period_start": m_start.isoformat(),
-                "period_end": m_end.isoformat(),
-                "entries": [dict(entry) for entry in month_entries],
-            },
-        ],
-    }
+    snapshot = _snapshot_payload_from_context(context, now, send_result=send_result)
     export_latest_leaderboards(snapshot)
 
 

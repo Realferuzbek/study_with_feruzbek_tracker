@@ -75,6 +75,13 @@ def _post_snapshot(snapshot: Dict[str, Any]) -> None:
         _LOGGER.warning("[export] failed: %s", exc)
 
 
+def send_export(snapshot: Dict[str, Any]) -> None:
+    """Send the given snapshot to the ingest endpoint synchronously."""
+    if not _should_export():
+        return
+    _post_snapshot(snapshot.copy())
+
+
 def export_latest_leaderboards(snapshot: Dict[str, Any]) -> None:
     """Export the latest leaderboard snapshot to the ingest endpoint."""
 
@@ -82,9 +89,8 @@ def export_latest_leaderboards(snapshot: Dict[str, Any]) -> None:
         return
 
     thread = threading.Thread(
-        target=_post_snapshot,
-        args=(snapshot.copy(),),
+        target=send_export,
+        args=(snapshot,),
         daemon=True,
     )
     thread.start()
-
