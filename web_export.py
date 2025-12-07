@@ -37,19 +37,23 @@ def _timeout_seconds() -> float:
     return millis / 1000.0
 
 
-def _post_snapshot(snapshot: Dict[str, Any]) -> None:
-    url = os.getenv("LEADERBOARD_INGEST_URL")
-    secret = os.getenv("LEADERBOARD_INGEST_SECRET")
-    if not url or not secret:
-        return
-
-    payload = {
+def build_export_payload(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    return {
         "posted_at": snapshot.get("posted_at"),
         "source": "tracker",
         "message_id": snapshot.get("message_id"),
         "chat_id": snapshot.get("chat_id"),
         "boards": snapshot.get("boards", []),
     }
+
+
+def _post_snapshot(snapshot: Dict[str, Any], *, capture_response: bool = False):
+    url = os.getenv("LEADERBOARD_INGEST_URL")
+    secret = os.getenv("LEADERBOARD_INGEST_SECRET")
+    if not url or not secret:
+        return
+
+    payload = build_export_payload(snapshot)
 
     try:
         data = json.dumps(payload).encode("utf-8")
@@ -69,17 +73,30 @@ def _post_snapshot(snapshot: Dict[str, Any]) -> None:
 
     try:
         with urllib.request.urlopen(req, timeout=_timeout_seconds()) as resp:
-            resp.read()
-        _LOGGER.info("[export] sent")
+            body = resp.read()
+            status = getattr(resp, "status", None) or getattr(resp, "code", None)
+        _LOGGER.info("[export] sent status=%s", status)
+        if capture_response:
+            decoded = body.decode("utf-8", errors="ignore")
+            return status, decoded
     except Exception as exc:  # pragma: no cover - network failures are logged
         _LOGGER.warning("[export] failed: %s", exc)
+        if capture_response:
+            status = getattr(exc, "code", None)
+            body = ""
+            try:
+                if hasattr(exc, "read"):
+                    body = exc.read().decode("utf-8", errors="ignore")  # type: ignore[attr-defined]
+            except Exception:
+                body = ""
+            return status, body
 
 
-def send_export(snapshot: Dict[str, Any]) -> None:
+def send_export(snapshot: Dict[str, Any], *, capture_response: bool = False):
     """Send the given snapshot to the ingest endpoint synchronously."""
     if not _should_export():
         return
-    _post_snapshot(snapshot.copy())
+    return _post_snapshot(snapshot.copy(), capture_response=capture_response)
 
 
 def export_latest_leaderboards(snapshot: Dict[str, Any]) -> None:
