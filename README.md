@@ -1,67 +1,24 @@
-﻿# Focus Squad
+📊 Study With Feruzbek Tracker (Public Showcase)
+Telegram-based productivity tracker built with Python + Telethon.
 
-Next.js 14 app for the Focus Squad community. Features Google authentication via NextAuth, Supabase integration for task tracking, live session status powered by Telegram bot events, and real-time updates through Supabase Realtime.
+🔥 What it does
+Tracks join/leave of voice chats in study groups
+Calculates total focus minutes per user
+Posts daily/weekly leaderboards automatically
+🧠 How it works (high level)
+Listens to Telegram events (Telethon)
+Logs sessions locally (e.g., SQLite/CSV)
+Aggregates minutes per user
+Sends a formatted leaderboard message
+🖼 Demo (sample)
+See \examples/example_output.txt\ for a sample leaderboard.
 
-## Getting Started
+⚠️ Source code is private to protect API keys and anti-abuse logic. This repo is a public overview only. For a private walkthrough, DM @Realferuzbek on Telegram.
 
-1. Install dependencies:
-   ```bash
-   npm install
-   ```
-2. Copy `.env.example` to `.env.local` (create one with the required keys) and fill in Supabase, Google, Telegram, and cron secrets.
-3. Run the dev server:
-   ```bash
-   npm run dev
-   ```
-
-## Environment Variables
-
-- `NEXTAUTH_SECRET`
-- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
-- `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`
-- `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_GROUP_ID`, `TELEGRAM_BOT_USERNAME`
-- `PUBLIC_TG_GROUP_LINK`
-- `CRON_SECRET`
-- `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `NEXT_PUBLIC_VAPID_PUBLIC_KEY`, `VAPID_SUBJECT`
-- `LEADERBOARD_WEB_EXPORT_ENABLED`
-- `LEADERBOARD_INGEST_URL`
-- `LEADERBOARD_INGEST_SECRET`
-- `LEADERBOARD_EXPORT_TIMEOUT_MS`
-
-## Web Push Setup
-
-Generate a VAPID key pair (run once) and copy the values into `.env.local`:
-
-```bash
-node -e "const webpush = require('web-push'); const keys = webpush.generateVAPIDKeys(); console.log(keys);"
-```
-
-Add the resulting values as:
-
-```
-VAPID_PUBLIC_KEY=...
-VAPID_PRIVATE_KEY=...
-NEXT_PUBLIC_VAPID_PUBLIC_KEY=...
-VAPID_SUBJECT=mailto:hello@example.com
-```
-
-`VAPID_SUBJECT` can be a `mailto:` address or an HTTPS origin that identifies your application.
-
-## Scripts
-
-- `npm run dev` – start development server (port 3000)
-- `npm run build` – production build
-- `npm run start` – start production server
-- `npm run lint` – run ESLint
-
-## Managing Secrets Safely
-
-Secrets now live in `var/secure_env.dat`, encrypted with Windows DPAPI. Use the helper to manage them:
-
-```bash
-python scripts/secure_env_tool.py list
-python scripts/secure_env_tool.py set TELEGRAM_API_HASH your_value_here
-```
-
-`.env.local` should only contain non-sensitive defaults. To migrate an existing plaintext file into the encrypted store run `python scripts/secure_env_tool.py migrate`.
+🧰 Tech
+Python 3.x
+Telethon
+Windows Task Scheduler (automation)
+📨 Contact
+Telegram: @Realferuzbek
+GitHub: Realferuzbek
