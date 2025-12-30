@@ -20,6 +20,7 @@ runner.log
 *.log.*
 
 # Python / local stuff
+.venv/
 __pycache__/
 *.pyc
 *.pyo

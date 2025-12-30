@@ -1,0 +1,12 @@
+aiosqlite==0.21.0
+colorama==0.4.6
+git-filter-repo==2.47.0
+pillow==11.3.0
+pyaes==1.6.1
+pyasn1==0.6.1
+qrcode==8.2
+rsa==4.9.1
+ruff==0.4.4
+Telethon==1.41.2
+typing_extensions==4.15.0
+tzdata==2025.2

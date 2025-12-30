@@ -1,4 +1,4 @@
-# F:\study_with_me\reset_all.py
+# reset_all.py
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -35,3 +35,4 @@ try: POST_NOW_FLAG.unlink()
 except FileNotFoundError: pass
 
 print(f"Reset done. New anchor_date={anchor}. Next post will be DAY 1, WEEK 1, MONTH 1 from this date.")
+

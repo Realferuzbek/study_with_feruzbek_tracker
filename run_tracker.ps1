@@ -1,13 +1,17 @@
-﻿$ErrorActionPreference = 'Continue'
+$ErrorActionPreference = 'Continue'
 function Log($m){ $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); Write-Output "$ts $m" }
 
 # Single-instance guard (global)
 $mutex = $null
 try {
   Log "wrapper start as $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
-  $python = 'F:\study_with_me\.venv\Scripts\python.exe'
-  $script = 'F:\study_with_me\study_tracker.py'
-  $cwd    = 'F:\study_with_me'
+
+  $root = $PSScriptRoot
+  if (-not $root) { $root = (Get-Location).Path }
+
+  $python = Join-Path $root ".venv\\Scripts\\python.exe"
+  $script = Join-Path $root "study_tracker.py"
+  $cwd    = $root
 
   if (-not (Test-Path $python)) { Log "Python missing: $python"; exit 2 }
   if (-not (Test-Path $script)) { Log "Script missing: $script"; exit 3 }

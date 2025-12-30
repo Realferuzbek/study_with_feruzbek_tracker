@@ -1,5 +1,6 @@
 /** @type {import('next').NextConfig} */
-const SUPABASE_HOST = new URL(process.env.NEXT_PUBLIC_SUPABASE_URL).host;
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_HOST = SUPABASE_URL ? new URL(SUPABASE_URL).host : null;
 
 const nextConfig = {
   reactStrictMode: true,
@@ -13,7 +14,12 @@ const nextConfig = {
       { protocol: 'https', hostname: 'media.licdn.com' },
     ],
     // add explicit domains so Next/Image is happy everywhere
-    domains: [SUPABASE_HOST, 'lh3.googleusercontent.com', 'avatars.githubusercontent.com', 'media.licdn.com'],
+    domains: [
+      SUPABASE_HOST,
+      'lh3.googleusercontent.com',
+      'avatars.githubusercontent.com',
+      'media.licdn.com',
+    ].filter(Boolean),
   },
 };
 

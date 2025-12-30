@@ -1,4 +1,4 @@
-# F:\study_with_me\meta_tool.py
+# meta_tool.py
 import sqlite3, sys, datetime
 from pathlib import Path
 
@@ -43,3 +43,4 @@ if __name__ == "__main__":
         print("  python meta_tool.py --hard-reset")
 
 con.close()
+

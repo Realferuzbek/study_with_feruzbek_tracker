@@ -1,3 +1,4 @@
-& "F:\study_with_me\scripts\stop_tracker.ps1"
-& "F:\study_with_me\.venv\Scripts\python.exe" "F:\study_with_me\reset_all.py"
-& "F:\study_with_me\scripts\start_tracker.ps1"
+$repoRoot = Split-Path -Parent $PSScriptRoot
+& (Join-Path $PSScriptRoot "stop_tracker.ps1")
+& (Join-Path $repoRoot ".venv\\Scripts\\python.exe") (Join-Path $repoRoot "reset_all.py")
+& (Join-Path $PSScriptRoot "start_tracker.ps1")

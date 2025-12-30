@@ -1,11 +1,11 @@
-﻿# F:\study_with_me\study_tracker.py
+# study_tracker.py
 # Event-driven, robust Telegram Study Tracker.
 # - Near real-time join/leave via Raw updates (+ snapshot fetch)
 # - Pagination (no 200-cap)
 # - Backoff networking
 # - Per-videochat 5-minute gate (sub-5m is ignored entirely for all boards)
 # - Alias merge (your accounts merged into @realferuzbek)
-# - Daily auto post at 22:00 Asia/Tashkent
+# - Daily auto post at 21:30 Asia/Tashkent
 # - Manual "post now" without breaking daily schedule (post_now.flag)
 
 import asyncio, time, re, sqlite3, os, sys, traceback, random, html, json, urllib.parse, urllib.request, urllib.error
@@ -1645,7 +1645,7 @@ async def main():
     STATE.ent = await resolve_group(GROUP)
     _maybe_reset_on_group_change(STATE.ent)
 
-    print("Tracker running. Will post automatically at 21:00 Asia/Tashkent.")
+    print("Tracker running. Will post automatically at 21:30 Asia/Tashkent.")
     me = await client.get_me()
     MY_ID = me.id
     print("Running as user id:", MY_ID)
@@ -1656,7 +1656,7 @@ async def main():
     # NEW: catch-up DM if we were down a while (6/6)
     await _notify_catchup_if_needed()
 
-    # --- Backfill any missed days on startup (and today if after 22:00) ---
+    # --- Backfill any missed days on startup (and today if after 21:30) ---
     last_posted = db_get_meta("last_post_date")  # ISO string or None
     now = datetime.now(TZ)
     today = now.date()
@@ -1675,9 +1675,9 @@ async def main():
             to_post.append(d)
             d += timedelta(days=1)
         if (now.hour, now.minute) >= (POST_HOUR, POST_MINUTE) and lp != today:
-            to_post.append(today)  # also post today immediately if we’re already past 22:00
+            to_post.append(today)  # also post today immediately if we’re already past 21:30
     else:
-        # first-ever run: only post immediately if we’re already past 22:00 today
+        # first-ever run: only post immediately if we’re already past 21:30 today
         if (now.hour, now.minute) >= (POST_HOUR, POST_MINUTE):
             to_post.append(today)
 
@@ -1778,3 +1778,4 @@ if __name__ == "__main__":
         except Exception:
             pass
         print("\nExiting cleanly. Bye")
+
