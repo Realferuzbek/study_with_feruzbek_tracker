@@ -1,105 +1,212 @@
-# Focus Squad Study Tracker
+# Studywithferuzbek Tracker — Telegram Study Leaderboards (Day / Week / Month)
 
-A Python-based Telegram study tracker that measures real participation in a study group and publishes daily/weekly/monthly leaderboards—with an optional web dashboard export.
+A **Python + Telethon** tracker that monitors a Telegram group’s active voice/video call participation and produces **daily / weekly / monthly leaderboards**, with:
+- automatic daily posting at a fixed time,
+- a manual “post now” trigger,
+- optional export to a web dashboard ingest endpoint,
+- and Windows-friendly secret storage (DPAPI) for local operation.
 
-**For:** online study communities that want accountability without manual spreadsheets.
-
-## Demo
-
-- Web leaderboard (dashboard): https://studywithferuzbek.vercel.app/leaderboard
-- Telegram group (leaderboard posts): https://t.me/studywithferuzbek
-
-## Screenshots
-
-> Add images under `docs/screenshots/` and update paths below.
-
-- `docs/screenshots/dashboard.png`
-- `docs/screenshots/telegram_post.png`
+> This repo also includes a **minimal Next.js API** endpoint (`/api/admin/state`) protected by a shared secret (optional utility).
 
 ---
 
-## Features
+## What problem this solves
 
-- Tracks Telegram voice/video chat presence using Telethon (event-driven + polling fallback).
-- Stores per-user study totals in local SQLite (`var/study.db`).
-- Computes leaderboards for day / week / rolling 30 days.
-- Daily auto-post at 21:30 Asia/Tashkent (plus optional manual “post now”).
-- Alias/username merge support (e.g., multiple accounts → one identity).
-- Minimum-session gate (prevents tiny joins from skewing rankings).
-- Generates snapshot payloads and optionally exports to a webhook for a web dashboard.
-- Includes a minimal Next.js API endpoint for admin/state checks (`/api/admin/state`) (optional).
+In study communities, consistency is hard to maintain because “effort” is not visible.  
+This tracker turns participation into a measurable signal:
+- consistent leaderboard snapshots,
+- predictable daily posting,
+- and (optionally) a pipeline into a web dashboard for history/visualization.
 
 ---
 
-## Tech Stack
+## Core features (code-backed)
 
-**Tracker (core)**
-- Python
-- Telethon (Telegram client)
-- SQLite (local persistence)
+### 1) Daily auto-posting (Asia/Tashkent)
+- Scheduled daily leaderboard post at **21:30 Asia/Tashkent**
+- Startup backfill logic: posts any missed days and can post “today” immediately if the service starts after 21:30
 
-**Optional tooling**
-- PowerShell / VBScript wrappers (Windows)
-- Next.js 14 (minimal API route for admin/state)
+### 2) Manual “post now” trigger
+- Running `python post_now.py` creates a flag file:
+  - `post_now.flag`
+- The tracker detects it and posts without breaking the daily schedule
 
----
+### 3) Minimum session-time gate (anti-noise)
+- Participation segments shorter than **300 seconds (5 minutes)** are ignored for leaderboard calculations
 
-## How It Works
+### 4) Leaderboards (day / week / month)
+- Generates separate leaderboards for:
+  - **today**
+  - **current week**
+  - **current month**
+- Formats output for Telegram posting
 
-1. A Telethon client listens to Telegram group call updates and maintains a presence model.
-2. A periodic fallback snapshot poll (e.g., ~30s) ensures robustness if raw updates are missed.
-3. Session seconds are accumulated per user and persisted to `var/study.db`.
-4. At 21:30 Asia/Tashkent, the tracker computes leaderboard windows and renders a post.
-5. The post is sent to Telegram either via:
-   - Bot API (if configured), or
-   - the authenticated Telethon user session.
-6. If enabled, the tracker exports the snapshot to a webhook for a dashboard/history view.
+### 5) Posting transport options
+- Can post via:
+  - a **user session** (Telethon session / StringSession), or
+  - a **Telegram bot** (if bot env vars are provided)
 
----
+### 6) Local persistence (SQLite + state JSON)
+- SQLite database stored at:
+  - `var/study.db`
+- Operational state file:
+  - `tracker_state.json`
+- Logs written under:
+  - `var/`
 
-## Evidence / Proof
+### 7) Optional: export to a web dashboard ingest endpoint
+- When enabled, exports the latest snapshot to:
+  - `LEADERBOARD_INGEST_URL`
+- Uses shared secret header:
+  - `LEADERBOARD_INGEST_SECRET`
+- Toggle:
+  - `LEADERBOARD_WEB_EXPORT_ENABLED=true`
 
-- Daily auto-post schedule is configured in code as 21:30 Asia/Tashkent (`POST_HOUR=21`, `POST_MINUTE=30`, `TZ`).
-- Persistent storage is local SQLite (`var/study.db`) for auditable, replayable totals.
-- Supports both event-driven updates and a polling fallback for reliability.
-- Secrets are designed to stay out of git via `.env.local` and an optional Windows DPAPI-backed store (`var/secure_env.dat`).
+### 8) Separation guard (web integration stays isolated)
+- `scripts/verify-separation.py` enforces that website-integration references stay inside `web_export.py`
 
-> If you want admissions-grade metrics (uptime, active users, posts/day, latency), see “Measurement Plan” in the Roadmap section below.
-
----
-
-## My Role & Contributions
-
-**Primary author (solo): Feruzbek Qurbonov**
-
-I owned:
-- System design: presence tracking → persistence → leaderboard computation → posting pipeline
-- Reliability strategy: event updates + polling fallback
-- Automation: daily scheduled posting and manual override flow
-- Reproducibility and repo hygiene: env scaffolding, script portability, and setup clarity
-
----
-
-## Roadmap
-
-**Short-term (1–2 weeks)**
-- Add a reproducible “Measurement Plan” script: post latency, run stability, and error rate logging.
-- Add tests for leaderboard aggregation and edge cases (alias merge, minimum-session gate).
-- Add a `docs/screenshots/` folder and keep README visuals up to date.
-
-**Mid-term (1–2 months)**
-- Standardize the webhook export schema and publish a reference dashboard receiver.
-- Add a lightweight admin UI for reviewing/merging aliases safely.
-
-**Long-term**
-- Research: anomaly detection for suspicious sessions (e.g., bot-like joins) and fairness-aware ranking.
-- Multi-community support with isolated configs and storage per group.
+### 9) Windows DPAPI secret storage (optional)
+- `secure_env.py` + `scripts/secure_env_tool.py` provide a **DPAPI-backed** store for secrets (Windows)
+- Designed so plaintext secrets don’t need to live on disk
 
 ---
 
-## Configuration
+## High-level architecture
 
-Create `.env.local` from `.env.example`:
+1) Tracker connects to Telegram using Telethon  
+2) Call-related updates trigger roster refresh + participation accounting  
+3) Participation is accumulated per user, with alias grouping support  
+4) Leaderboards are generated for day/week/month  
+5) Output is posted to Telegram (user session or bot)  
+6) Optional: snapshot is exported to a web ingest endpoint
 
+---
+
+## Repo layout (important files)
+
+### Python (tracker + tools)
+- `study_tracker.py` — main tracker (scheduler, tracking, leaderboards, posting)
+- `post_now.py` — manual post trigger (creates `post_now.flag`)
+- `web_export.py` — optional export to dashboard ingest endpoint
+- `env_loader.py` — environment loading (includes DPAPI store integration)
+- `tg_session_qr.py` — StringSession generator (prints session string)
+- `login.py` — login/session sanity check
+- `scripts/secure_env_tool.py` — DPAPI secret manager (Windows)
+- `scripts/verify-separation.py` — separation guard
+
+### Next.js (optional utility)
+- `app/api/admin/state/route.ts` — protected endpoint returning `session_version`
+  - Auth via `x-cron-secret: <CRON_SECRET>` or `Authorization: Bearer <CRON_SECRET>`
+- `middleware.ts` — request gating for the Next.js app
+- `package.json` — Next.js scripts (`dev`, `build`, `start`, `lint`)
+
+---
+
+## Run locally (Tracker)
+
+### 1) Create venv
+```bash
+python -m venv .venv
+```
+
+### 2) Install dependencies
+```bash
+# Windows
+.venv\Scripts\pip install -r requirements.txt
+
+# macOS/Linux
+.venv/bin/pip install -r requirements.txt
+```
+
+### 3) Configure environment
 ```bash
 cp .env.example .env.local
+```
+
+Fill in `.env.local` values (names are listed below).
+
+### 4) Start tracker
+```bash
+# Windows
+.venv\Scripts\python study_tracker.py
+
+# macOS/Linux
+.venv/bin/python study_tracker.py
+```
+
+### 5) Manual “post now” (optional)
+```bash
+python post_now.py
+```
+
+---
+
+## Run locally (Next.js utility endpoint — optional)
+
+```bash
+npm ci
+npm run dev
+```
+
+Protected endpoint:
+- `GET /api/admin/state`
+
+Auth (one of):
+- `x-cron-secret: <CRON_SECRET>`
+- `Authorization: Bearer <CRON_SECRET>`
+
+---
+
+## Environment variables (exactly from `.env.example`)
+
+### Telegram (required)
+- `TELEGRAM_API_ID`
+- `TELEGRAM_API_HASH`
+- `TELEGRAM_GROUP_USERNAME`
+
+### Optional: StringSession (recommended vs local session file)
+- `TG_STRING_SESSION`
+
+### Optional: Bot-based posting
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_BOT_USERNAME`
+- `TELEGRAM_BOT_TARGET`
+- `TELEGRAM_GROUP_ID`
+
+### Optional: Web export to dashboard ingest
+- `LEADERBOARD_WEB_EXPORT_ENABLED`
+- `LEADERBOARD_INGEST_URL`
+- `LEADERBOARD_INGEST_SECRET`
+- `LEADERBOARD_EXPORT_TIMEOUT_MS`
+
+### Optional: Next.js admin state endpoint
+- `CRON_SECRET`
+
+---
+
+## Configuration notes (kept minimal)
+
+- Alias grouping exists in code (merge multiple usernames under one canonical user).  
+  If you fork this repo, review `ALIAS_GROUPS_USERNAMES` in `study_tracker.py` and adjust as needed.
+
+- Watchdog notifications exist in code and are configurable in `study_tracker.py`.
+
+---
+
+## Security & privacy
+
+- **Do not commit secrets.** Use `.env.local` or the Windows DPAPI secret store.
+- If you use `TG_STRING_SESSION`, you can avoid creating a local `.session` file.
+- Web export is protected with a shared secret (`LEADERBOARD_INGEST_SECRET`).
+
+---
+
+## My role & contributions
+
+I led this project as the **product owner and context/architecture engineer**:
+- defined the leaderboard logic and reliability goals (scheduling, backfill, min-session gate)
+- designed the export pipeline for integrating with a web dashboard
+- added operational tooling (manual post trigger, separation guard, secret handling)
+- handled environment setup, deployment configuration, and debugging
+
+Implementation was accelerated with AI-assisted development tools; I owned the architecture decisions, integration work, and shipping.
