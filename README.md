@@ -226,6 +226,6 @@ I led this project as the **product owner and context/architecture engineer**:
 - defined the leaderboard logic and reliability goals (scheduling, backfill, min-session gate)
 - designed the export pipeline for integrating with a web dashboard
 - added operational tooling (manual post trigger, separation guard, secret handling)
-- handled environment setup, deployment configuration, and debugging
+- handled environment setup, deployment configuration, and debugging.
 
 Implementation was accelerated with AI-assisted development tools; I owned the architecture decisions, integration work, and shipping.
