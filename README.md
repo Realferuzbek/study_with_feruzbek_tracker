@@ -10,16 +10,6 @@ A **Python + Telethon** tracker that monitors a Telegram group’s active voice/
 
 ---
 
-## What problem this solves
-
-In study communities, consistency is hard to maintain because “effort” is not visible.  
-This tracker turns participation into a measurable signal:
-- consistent leaderboard snapshots,
-- predictable daily posting,
-- and (optionally) a pipeline into a web dashboard for history/visualization.
-
----
-
 ## Screenshots (real usage)
 
 <table>
@@ -36,6 +26,16 @@ This tracker turns participation into a measurable signal:
     </td>
   </tr>
 </table>
+
+---
+
+## What problem this solves
+
+In study communities, consistency is hard to maintain because “effort” is not visible.  
+This tracker turns participation into a measurable signal:
+- consistent leaderboard snapshots,
+- predictable daily posting,
+- and (optionally) a pipeline into a web dashboard for history/visualization.
 
 ---
 
