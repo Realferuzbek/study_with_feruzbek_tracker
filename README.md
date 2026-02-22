@@ -20,6 +20,25 @@ This tracker turns participation into a measurable signal:
 
 ---
 
+## Screenshots (real usage)
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src="assets/readme/leaderboard.jpg" alt="Telegram leaderboard output" width="100%" />
+      <br />
+      <sub><b>Automated Telegram leaderboard post (day / week / month)</b></sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="assets/readme/members.jpg" alt="Live study session with members" width="100%" />
+      <br />
+      <sub><b>Live study session environment (members + focus workflow)</b></sub>
+    </td>
+  </tr>
+</table>
+
+---
+
 ## Core features (code-backed)
 
 ### 1) Daily auto-posting (Asia/Tashkent)
